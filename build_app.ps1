@@ -11,6 +11,8 @@ $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootDir = Split-Path -Parent $AppDir
 $VenvDir = Join-Path $RootDir ".venv"
 $Python = Join-Path $VenvDir "Scripts\python.exe"
+$SitePackages = Join-Path $VenvDir "Lib\site-packages"
+$NvidiaCudnnDir = Join-Path $SitePackages "nvidia\cudnn"
 
 if (-not (Test-Path $Python)) {
     Write-Host "Creating virtual environment: $VenvDir"
@@ -38,6 +40,9 @@ try {
     }
 
     & $Python -m pip install --upgrade pyinstaller
+    if (-not (Test-Path $NvidiaCudnnDir)) {
+        throw "nvidia-cudnn-cu12 was not found in the build environment: $NvidiaCudnnDir"
+    }
 
     & $Python -m PyInstaller `
         --noconfirm `
@@ -48,6 +53,15 @@ try {
         --add-data "config.yaml;." `
         --add-data "LICENSE.md;." `
         --add-data "assets;assets" `
+        --add-data "$NvidiaCudnnDir;nvidia\cudnn" `
+        --collect-all imagesize `
+        --copy-metadata imagesize `
+        --copy-metadata nvidia-cudnn-cu12 `
+        --copy-metadata opencv-contrib-python `
+        --copy-metadata pyclipper `
+        --copy-metadata pypdfium2 `
+        --copy-metadata python-bidi `
+        --copy-metadata shapely `
         --collect-all PySide6 `
         --collect-all paddle `
         --collect-all paddleocr `

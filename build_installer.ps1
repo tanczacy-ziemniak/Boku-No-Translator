@@ -11,6 +11,7 @@ $RootDir = Split-Path -Parent $AppDir
 $Python = Join-Path $RootDir ".venv\Scripts\python.exe"
 $DistDir = Join-Path $AppDir "dist\$AppName"
 $ReleaseDir = Join-Path $AppDir "release"
+$ReleasePackageDir = Join-Path $ReleaseDir "$AppName-package"
 $PayloadDir = Join-Path $AppDir "build\installer_payload"
 $PayloadZip = Join-Path $PayloadDir "$AppName-package.zip"
 $SetupExe = Join-Path $ReleaseDir "$AppName-setup.exe"
@@ -34,9 +35,35 @@ if (Test-Path $PayloadDir) {
 New-Item -ItemType Directory -Force -Path $PayloadDir | Out-Null
 
 Compress-Archive -Path (Join-Path $DistDir "*") -DestinationPath $PayloadZip -Force
+if (Test-Path $ReleasePackageDir) {
+    Remove-Item -LiteralPath $ReleasePackageDir -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $ReleasePackageDir | Out-Null
+Copy-Item -Path (Join-Path $DistDir "*") -Destination $ReleasePackageDir -Recurse -Force
 
 $InstallPs1 = Join-Path $PayloadDir "install_package.ps1"
 $InstallCmd = Join-Path $PayloadDir "install.cmd"
+
+function Copy-FileWithRetry {
+    param(
+        [Parameter(Mandatory=$true)][string]$Source,
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [int]$Attempts = 5
+    )
+
+    for ($Index = 1; $Index -le $Attempts; $Index++) {
+        try {
+            Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+            return $true
+        } catch {
+            if ($Index -ge $Attempts) {
+                Write-Warning "Could not copy '$Source' to '$Destination': $($_.Exception.Message)"
+                return $false
+            }
+            Start-Sleep -Milliseconds 700
+        }
+    }
+}
 
 @"
 `$ErrorActionPreference = "Stop"
@@ -69,7 +96,10 @@ New-Item -ItemType Directory -Force -Path (Join-Path `$DataDir "models\paddleocr
 New-Item -ItemType Directory -Force -Path (Join-Path `$DataDir "demo_capture\screenshots") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path `$DataDir "demo_capture\videos") | Out-Null
 
-Expand-Archive -LiteralPath `$PackageZip -DestinationPath `$InstallDir -Force
+Write-Host "Extracting app files..."
+`$VerbosePreference = "Continue"
+Expand-Archive -LiteralPath `$PackageZip -DestinationPath `$InstallDir -Force -Verbose
+`$VerbosePreference = "SilentlyContinue"
 
 `$ShortcutDir = Join-Path `$env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 New-Item -ItemType Directory -Force -Path `$ShortcutDir | Out-Null
@@ -141,8 +171,14 @@ echo Installation complete.
 pause
 "@ | Set-Content -LiteralPath $InstallCmd -Encoding ASCII
 
-Copy-Item -LiteralPath $PayloadZip -Destination (Join-Path $ReleaseDir "$AppName-package.zip") -Force
-Copy-Item -LiteralPath $InstallPs1 -Destination (Join-Path $ReleaseDir "install_$($AppName.Replace('-', '_')).ps1") -Force
+$ReleaseZip = Join-Path $ReleaseDir "$AppName-package.zip"
+$CopiedReleaseZip = Copy-FileWithRetry -Source $PayloadZip -Destination $ReleaseZip
+if (-not $CopiedReleaseZip) {
+    $FallbackZip = Join-Path $ReleaseDir "$AppName-package-fixed.zip"
+    Copy-Item -LiteralPath $PayloadZip -Destination $FallbackZip -Force
+    Write-Warning "Release ZIP was locked. Wrote fallback ZIP instead: $FallbackZip"
+}
+$null = Copy-FileWithRetry -Source $InstallPs1 -Destination (Join-Path $ReleaseDir "install_$($AppName.Replace('-', '_')).ps1")
 
 & $Python -m pip install --upgrade pyinstaller
 
