@@ -5,7 +5,7 @@
 <h1 align="center">Boku No Translator</h1>
 
 <p align="center">
-  A tray-first OCR translation overlay for games, visual novels, and live app windows.
+  Real-time translator for games powered by AI model.
 </p>
 
 <p align="center">
@@ -19,10 +19,6 @@
   <img alt="Hotkey" src="https://img.shields.io/badge/Hotkey-Ctrl%2BAlt%2BA-f59e0b">
   <img alt="License" src="https://img.shields.io/badge/License-Non--Commercial-red">
 </p>
-
-## Description
-Real-time translator for games powered by local OCR and a local AI translation model.
-
 
 ## Demo
 
