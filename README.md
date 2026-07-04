@@ -136,6 +136,13 @@ Build the packaged app:
 .\build_app.ps1
 ```
 
+If this makes an error with ErrorID which includes UnauthorizedAccess, try:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Scope Process
+```
+
+If this makes an error with ErrorID which includes Python, try to install python 3.11
+
 Create the installer:
 
 ```powershell
