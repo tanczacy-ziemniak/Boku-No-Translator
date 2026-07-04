@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Build and packaging outputs
+build/
+dist/
+release/
+*.spec
+
+# Runtime outputs
+demo_capture/
+extracted_text/
+paddle_vis/
+*.log
+
+# Translation/OCR caches
+translation_cache*.json
+*.jsonl
+live_snapshot.json
+current_text.txt
+
+# Downloaded models and local app data
+models/
+*.gguf
+*.pdmodel
+*.pdiparams
+*.onnx
+
+# Local/editor files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Installer leftovers
+*.cab
+*.msi
+*.exe
+*.zip
