@@ -68,7 +68,7 @@ For running or building from source:
 
 - Python 3.11 recommended
 - Dependencies listed in [requirements.txt](./requirements.txt)
-- Paddle runtime installed in the build environment; the build script keeps an existing GPU Paddle runtime or installs CPU `paddlepaddle` when none is detected
+- Paddle runtime is selected by `build_app.ps1` from the detected NVIDIA GPU compute capability
 
 ## Install
 
@@ -189,7 +189,10 @@ By default, the build script also prepares the Python-side CUDA runtime used by 
 
 - installs NVIDIA CUDA/cuDNN Python wheels such as `nvidia-cudnn-cu12`
 - installs a CUDA-enabled `llama-cpp-python` wheel from the configured wheel index
-- installs `paddlepaddle-gpu` when an NVIDIA GPU is detected
+- detects NVIDIA GPUs with `nvidia-smi` and selects the Paddle runtime automatically
+- uses Paddle CUDA 12.9 for RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090
+- uses Paddle CUDA 12.6 for modern RTX/GTX GPUs such as RTX 20, 30, and 40 series
+- uses Paddle CUDA 11.8 for older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards
 - falls back to CPU Paddle when no NVIDIA GPU is detected
 
 NVIDIA display drivers are not installed by the script. Install or update the NVIDIA driver separately if `nvidia-smi` is not available.
@@ -198,15 +201,36 @@ Useful build options:
 
 ```powershell
 .\build_app.ps1 -CpuOnly
+.\build_app.ps1 -PaddleGpuRuntime auto
+.\build_app.ps1 -PaddleGpuRuntime cuda118
+.\build_app.ps1 -PaddleGpuRuntime cuda126
+.\build_app.ps1 -PaddleGpuRuntime cuda129
+.\build_app.ps1 -PaddleGpuRuntime cpu
+.\build_app.ps1 -ForceBlackwellPaddle
 .\build_app.ps1 -Python311InstallerUrl "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
 .\build_app.ps1 -LlamaCudaWheelIndex "https://abetlen.github.io/llama-cpp-python/whl/cu124"
 .\build_app.ps1 -SkipDependencyInstall
 ```
 
+For RTX 5070 / 5080 / 5090 systems, the script should detect compute capability `12.0` automatically and select `cuda129`. If the target machine is RTX 50 series but the build machine is not, use:
+
+```powershell
+.\build_app.ps1 -PaddleGpuRuntime cuda129
+```
+
+The packaged ZIP contains one Paddle runtime selected at build time. If you build on one GPU family and move the ZIP to a very different GPU family, rebuild on the target PC or pass the matching `-PaddleGpuRuntime` option.
+
 Create the release ZIP and package folder:
 
 ```powershell
 .\build_installer.ps1 -SkipSetupExe
+```
+
+The installer build forwards the same Paddle runtime selector:
+
+```powershell
+.\build_installer.ps1 -PaddleGpuRuntime cuda129
+.\build_installer.ps1 -PaddleGpuRuntime cuda118 -SkipSetupExe
 ```
 
 The app executable is created at:

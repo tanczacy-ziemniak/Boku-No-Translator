@@ -2,8 +2,18 @@ param(
     [switch]$SkipDependencyInstall,
     [switch]$InstallCpuPaddle,
     [switch]$CpuOnly,
+    [switch]$ForceBlackwellPaddle,
+    [ValidateSet("auto", "cpu", "standard", "blackwell", "cuda118", "cuda126", "cuda129")]
+    [string]$PaddleGpuRuntime = "auto",
+    [string]$PaddleVersion = "3.3.1",
     [string]$Python311InstallerUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
-    [string]$LlamaCudaWheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+    [string]$LlamaCudaWheelIndex = "",
+    [string]$DefaultLlamaCudaWheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu124",
+    [string]$BlackwellLlamaCudaWheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu128",
+    [string]$PaddleCpuIndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cpu/",
+    [string]$PaddleCuda118IndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cu118/",
+    [string]$PaddleCuda126IndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cu126/",
+    [string]$PaddleCuda129IndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cu129/"
 )
 
 $ErrorActionPreference = "Stop"
@@ -127,6 +137,240 @@ function Test-NvidiaGpu {
     return $false
 }
 
+function ConvertTo-ComputeCapability {
+    param([string]$Text)
+    if (-not $Text) {
+        return $null
+    }
+    $Value = 0.0
+    $Style = [System.Globalization.NumberStyles]::Float
+    $Culture = [System.Globalization.CultureInfo]::InvariantCulture
+    if ([double]::TryParse($Text.Trim(), $Style, $Culture, [ref]$Value)) {
+        return $Value
+    }
+    return $null
+}
+
+function Get-ComputeCapabilityFromGpuName {
+    param([string]$Name)
+    if (-not $Name) {
+        return $null
+    }
+
+    if ($Name -match "RTX\s+50|Blackwell") { return 12.0 }
+    if ($Name -match "H100|H200|H800|H20|GH200") { return 9.0 }
+    if ($Name -match "RTX\s+40|L4|L40|L40S|Ada") { return 8.9 }
+    if ($Name -match "RTX\s+30|A100|A800|A40|A30|A10|A16|A2|RTX\s+A|Ampere") { return 8.6 }
+    if ($Name -match "RTX\s+20|GTX\s+16|T4|T1000|T2000|Turing|Quadro\s+RTX|Titan\s+RTX") { return 7.5 }
+    if ($Name -match "V100|Titan\s+V|Volta|GV100") { return 7.0 }
+    if ($Name -match "P100|GP100") { return 6.0 }
+    if ($Name -match "GTX\s+10|GT\s+1030|Titan\s+Xp|Titan\s+X|Tesla\s+P|Quadro\s+P|Pascal") { return 6.1 }
+    return $null
+}
+
+function Get-NvidiaGpuInfos {
+    $Candidates = @("nvidia-smi")
+    if ($env:SystemRoot) {
+        $Candidates += (Join-Path $env:SystemRoot "System32\nvidia-smi.exe")
+    }
+    foreach ($Candidate in $Candidates) {
+        try {
+            $Output = & $Candidate --query-gpu=index,name,compute_cap --format=csv,noheader,nounits 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $Infos = @()
+                foreach ($Line in $Output) {
+                    $Parts = $Line -split ","
+                    if ($Parts.Count -lt 3) {
+                        continue
+                    }
+                    $Name = $Parts[1].Trim()
+                    $ComputeCapability = ConvertTo-ComputeCapability $Parts[2]
+                    if ($null -eq $ComputeCapability) {
+                        $ComputeCapability = Get-ComputeCapabilityFromGpuName $Name
+                    }
+                    $Info = [PSCustomObject]@{
+                        Index = [int]($Parts[0].Trim())
+                        Name = $Name
+                        ComputeCapability = $ComputeCapability
+                    }
+                    $Infos += $Info
+                }
+                if ($Infos.Count -gt 0) {
+                    return $Infos
+                }
+            }
+
+            $FallbackOutput = & $Candidate --query-gpu=index,name --format=csv,noheader,nounits 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                $Infos = @()
+                foreach ($Line in $FallbackOutput) {
+                    $Parts = $Line -split ","
+                    if ($Parts.Count -lt 2) {
+                        continue
+                    }
+                    $Name = $Parts[1].Trim()
+                    $Info = [PSCustomObject]@{
+                        Index = [int]($Parts[0].Trim())
+                        Name = $Name
+                        ComputeCapability = Get-ComputeCapabilityFromGpuName $Name
+                    }
+                    $Infos += $Info
+                }
+                if ($Infos.Count -gt 0) {
+                    return $Infos
+                }
+            }
+        } catch {
+        }
+    }
+    return @()
+}
+
+function Get-NvidiaGpuSummaryText {
+    $Infos = Get-NvidiaGpuInfos
+    if ($Infos.Count -eq 0) {
+        return "No NVIDIA GPU detected by nvidia-smi."
+    }
+    $Rows = @()
+    foreach ($Info in $Infos) {
+        $Compute = "unknown"
+        if ($null -ne $Info.ComputeCapability) {
+            $Compute = $Info.ComputeCapability
+        }
+        $Rows += "gpu:$($Info.Index) $($Info.Name) compute=$Compute"
+    }
+    return ($Rows -join "; ")
+}
+
+function New-PaddleGpuRuntimePlan {
+    param(
+        [Parameter(Mandatory=$true)][string]$Mode,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [string]$PaddleIndexUrl = "",
+        [string]$CudaLabel = ""
+    )
+    return [PSCustomObject]@{
+        Mode = $Mode
+        Reason = $Reason
+        PaddleIndexUrl = $PaddleIndexUrl
+        CudaLabel = $CudaLabel
+    }
+}
+
+function Get-PaddleGpuRuntimePlan {
+    if ($CpuOnly -or $InstallCpuPaddle -or $PaddleGpuRuntime -eq "cpu") {
+        return New-PaddleGpuRuntimePlan `
+            -Mode "cpu" `
+            -Reason "CPU runtime was requested." `
+            -PaddleIndexUrl $PaddleCpuIndexUrl `
+            -CudaLabel "cpu"
+    }
+    if ($ForceBlackwellPaddle -or $PaddleGpuRuntime -eq "blackwell" -or $PaddleGpuRuntime -eq "cuda129") {
+        return New-PaddleGpuRuntimePlan `
+            -Mode "cuda129" `
+            -Reason "CUDA 12.9 Paddle runtime was requested." `
+            -PaddleIndexUrl $PaddleCuda129IndexUrl `
+            -CudaLabel "CUDA 12.9"
+    }
+    if ($PaddleGpuRuntime -eq "standard" -or $PaddleGpuRuntime -eq "cuda126") {
+        return New-PaddleGpuRuntimePlan `
+            -Mode "cuda126" `
+            -Reason "CUDA 12.6 Paddle runtime was requested." `
+            -PaddleIndexUrl $PaddleCuda126IndexUrl `
+            -CudaLabel "CUDA 12.6"
+    }
+    if ($PaddleGpuRuntime -eq "cuda118") {
+        return New-PaddleGpuRuntimePlan `
+            -Mode "cuda118" `
+            -Reason "CUDA 11.8 Paddle runtime was requested." `
+            -PaddleIndexUrl $PaddleCuda118IndexUrl `
+            -CudaLabel "CUDA 11.8"
+    }
+
+    $Infos = Get-NvidiaGpuInfos
+    if ($Infos.Count -eq 0) {
+        return New-PaddleGpuRuntimePlan `
+            -Mode "cpu" `
+            -Reason "No NVIDIA GPU was detected by nvidia-smi." `
+            -PaddleIndexUrl $PaddleCpuIndexUrl `
+            -CudaLabel "cpu"
+    }
+
+    foreach ($Info in $Infos) {
+        if (($null -ne $Info.ComputeCapability -and $Info.ComputeCapability -ge 12.0) -or $Info.Name -match "RTX\s+50|Blackwell") {
+            return New-PaddleGpuRuntimePlan `
+                -Mode "cuda129" `
+                -Reason "Detected NVIDIA Blackwell/RTX 50 GPU: $($Info.Name) compute=$($Info.ComputeCapability)." `
+                -PaddleIndexUrl $PaddleCuda129IndexUrl `
+                -CudaLabel "CUDA 12.9"
+        }
+    }
+
+    foreach ($Info in $Infos) {
+        if ($null -ne $Info.ComputeCapability -and $Info.ComputeCapability -lt 6.0) {
+            continue
+        }
+        if ($null -ne $Info.ComputeCapability -and $Info.ComputeCapability -lt 7.5) {
+            return New-PaddleGpuRuntimePlan `
+                -Mode "cuda118" `
+                -Reason "Detected legacy NVIDIA GPU best matched to Paddle CUDA 11.8: $($Info.Name) compute=$($Info.ComputeCapability)." `
+                -PaddleIndexUrl $PaddleCuda118IndexUrl `
+                -CudaLabel "CUDA 11.8"
+        }
+    }
+
+    foreach ($Info in $Infos) {
+        if ($null -ne $Info.ComputeCapability -and $Info.ComputeCapability -ge 7.5) {
+            return New-PaddleGpuRuntimePlan `
+                -Mode "cuda126" `
+                -Reason "Detected NVIDIA GPU best matched to Paddle CUDA 12.6: $($Info.Name) compute=$($Info.ComputeCapability)." `
+                -PaddleIndexUrl $PaddleCuda126IndexUrl `
+                -CudaLabel "CUDA 12.6"
+        }
+    }
+
+    foreach ($Info in $Infos) {
+        if ($null -eq $Info.ComputeCapability) {
+            return New-PaddleGpuRuntimePlan `
+                -Mode "cuda126" `
+                -Reason "Detected NVIDIA GPU, but compute capability was unknown. Defaulting to Paddle CUDA 12.6: $($Info.Name)." `
+                -PaddleIndexUrl $PaddleCuda126IndexUrl `
+                -CudaLabel "CUDA 12.6"
+        }
+    }
+
+    return New-PaddleGpuRuntimePlan `
+        -Mode "cpu" `
+        -Reason "Detected NVIDIA GPU(s), but compute capability is below the supported PaddleOCR/Paddle runtime range: $(Get-NvidiaGpuSummaryText)." `
+        -PaddleIndexUrl $PaddleCpuIndexUrl `
+        -CudaLabel "cpu"
+}
+
+function Test-BlackwellGpu {
+    if ($ForceBlackwellPaddle) {
+        return $true
+    }
+    return ((Get-PaddleGpuRuntimePlan).Mode -eq "cuda129")
+}
+
+function Get-PythonWheelTag {
+    $Tag = & $Python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $Tag) {
+        throw "Could not determine Python wheel tag."
+    }
+    return ($Tag | Select-Object -First 1).Trim()
+}
+
+function Get-EffectiveLlamaCudaWheelIndex {
+    if ($LlamaCudaWheelIndex) {
+        return $LlamaCudaWheelIndex
+    }
+    if ((Get-PaddleGpuRuntimePlan).Mode -eq "cuda129") {
+        return $BlackwellLlamaCudaWheelIndex
+    }
+    return $DefaultLlamaCudaWheelIndex
+}
+
 function Test-PythonPackage {
     param([Parameter(Mandatory=$true)][string]$PackageName)
     & $Python -c "import importlib.metadata as md; raise SystemExit(0 if '$PackageName' in [d.metadata.get('Name','').lower() for d in md.distributions()] else 1)" 1>$null 2>$null
@@ -139,54 +383,82 @@ function Install-CudaPythonPackages {
         return
     }
 
-    Write-Host "Installing CUDA runtime Python packages used by the bundled app..."
-    & $Python -m pip install --upgrade `
-        nvidia-cublas-cu12 `
-        nvidia-cuda-runtime-cu12 `
-        nvidia-cudnn-cu12 `
-        nvidia-cufft-cu12 `
-        nvidia-curand-cu12 `
-        nvidia-cusolver-cu12 `
-        nvidia-cusparse-cu12 `
-        nvidia-nvjitlink-cu12
+    $RuntimePlan = Get-PaddleGpuRuntimePlan
+    Write-Host "NVIDIA GPU summary: $(Get-NvidiaGpuSummaryText)"
+    Write-Host "Selected Paddle runtime: $($RuntimePlan.Mode) / $($RuntimePlan.CudaLabel) ($($RuntimePlan.Reason))"
+
+    if ($RuntimePlan.Mode -eq "cpu") {
+        Write-Host "Skipping CUDA Python package installation because CPU runtime was selected."
+        return
+    }
+
+    if ($RuntimePlan.Mode -eq "cuda129") {
+        Write-Host "Installing CUDA 12.9 Python runtime packages for Blackwell/RTX 50..."
+        & $Python -m pip install --upgrade `
+            nvidia-cublas-cu12==12.9.2.10 `
+            nvidia-cuda-runtime-cu12==12.9.79 `
+            nvidia-cudnn-cu12==9.9.0.52 `
+            nvidia-cufft-cu12==11.4.1.4 `
+            nvidia-curand-cu12==10.3.10.19 `
+            nvidia-cusolver-cu12==11.7.5.82 `
+            nvidia-cusparse-cu12==12.5.10.65 `
+            nvidia-nvjitlink-cu12==12.9.86
+    } else {
+        Write-Host "Installing CUDA runtime Python packages used by the bundled app..."
+        & $Python -m pip install --upgrade `
+            nvidia-cublas-cu12 `
+            nvidia-cuda-runtime-cu12 `
+            nvidia-cudnn-cu12 `
+            nvidia-cufft-cu12 `
+            nvidia-curand-cu12 `
+            nvidia-cusolver-cu12 `
+            nvidia-cusparse-cu12 `
+            nvidia-nvjitlink-cu12
+    }
 
     Write-Host "Installing CUDA-enabled llama-cpp-python wheel..."
+    $EffectiveLlamaCudaWheelIndex = Get-EffectiveLlamaCudaWheelIndex
+    Write-Host "  llama-cpp-python wheel index: $EffectiveLlamaCudaWheelIndex"
     $LlamaCudaDll = Join-Path $LlamaLibDir "ggml-cuda.dll"
-    if (Test-Path $LlamaCudaDll) {
-        & $Python -m pip install --upgrade --prefer-binary --extra-index-url $LlamaCudaWheelIndex llama-cpp-python
+    if ((Test-Path $LlamaCudaDll) -and $RuntimePlan.Mode -ne "cuda129") {
+        & $Python -m pip install --upgrade --prefer-binary --extra-index-url $EffectiveLlamaCudaWheelIndex llama-cpp-python
     } else {
-        & $Python -m pip install --upgrade --force-reinstall --prefer-binary --extra-index-url $LlamaCudaWheelIndex llama-cpp-python
+        & $Python -m pip install --upgrade --force-reinstall --prefer-binary --extra-index-url $EffectiveLlamaCudaWheelIndex llama-cpp-python
     }
 }
 
 function Ensure-PaddleRuntime {
-    $HasPaddle = & $Python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('paddle') else 1)" 1>$null 2>$null
-    $PaddleExists = ($LASTEXITCODE -eq 0)
+    $RuntimePlan = Get-PaddleGpuRuntimePlan
+    Write-Host "Paddle runtime plan: $($RuntimePlan.Mode) / $($RuntimePlan.CudaLabel) ($($RuntimePlan.Reason))"
 
-    if ($CpuOnly -or $InstallCpuPaddle) {
+    if ($RuntimePlan.Mode -eq "cpu") {
         Write-Host "Installing CPU Paddle runtime."
-        & $Python -m pip uninstall -y paddlepaddle-gpu 2>$null
-        & $Python -m pip install --upgrade paddlepaddle
+        Write-Host "  $($RuntimePlan.PaddleIndexUrl)"
+        if (Test-PythonPackage "paddlepaddle-gpu") {
+            & $Python -m pip uninstall -y paddlepaddle-gpu
+        }
+        & $Python -m pip install --upgrade "paddlepaddle==$PaddleVersion" -i $RuntimePlan.PaddleIndexUrl
         return
     }
 
-    if (Test-NvidiaGpu) {
-        Write-Host "NVIDIA GPU detected. Installing GPU Paddle runtime."
-        & $Python -m pip uninstall -y paddlepaddle 2>$null
-        & $Python -m pip install --upgrade paddlepaddle-gpu
+    if ($RuntimePlan.Mode -eq "cuda118" -or $RuntimePlan.Mode -eq "cuda126" -or $RuntimePlan.Mode -eq "cuda129") {
+        Write-Host "Installing GPU Paddle runtime: $($RuntimePlan.CudaLabel)."
+        Write-Host "  $($RuntimePlan.PaddleIndexUrl)"
+        if (Test-PythonPackage "paddlepaddle") {
+            & $Python -m pip uninstall -y paddlepaddle
+        }
+        if (Test-PythonPackage "paddlepaddle-gpu") {
+            & $Python -m pip uninstall -y paddlepaddle-gpu
+        }
+        & $Python -m pip install --upgrade "paddlepaddle-gpu==$PaddleVersion" -i $RuntimePlan.PaddleIndexUrl
         return
-    }
-
-    if (-not $PaddleExists) {
-        Write-Host "No NVIDIA GPU detected. Installing CPU Paddle runtime."
-        & $Python -m pip install --upgrade paddlepaddle
-    } else {
-        Write-Host "Using existing Paddle runtime from the build environment."
     }
 }
 
 function Assert-GpuBuildInputs {
-    if ($CpuOnly) {
+    $RuntimePlan = Get-PaddleGpuRuntimePlan
+    if ($RuntimePlan.Mode -eq "cpu") {
+        Write-Host "CPU Paddle runtime selected. Skipping CUDA build input assertions."
         return
     }
     if (-not (Test-Path $NvidiaCudnnDir)) {
@@ -247,12 +519,17 @@ try {
         "--collect-all", "paddlex",
         "--collect-all", "llama_cpp",
         "--collect-all", "huggingface_hub",
+        "--collect-all", "modelscope",
         "--collect-all", "meikiocr",
         "--hidden-import", "paddle",
         "--hidden-import", "paddleocr",
         "--hidden-import", "paddlex",
         "--hidden-import", "llama_cpp",
-        "--hidden-import", "huggingface_hub"
+        "--hidden-import", "huggingface_hub",
+        "--exclude-module", "torch",
+        "--exclude-module", "torchvision",
+        "--exclude-module", "torchaudio",
+        "--exclude-module", "tensorflow"
     )
     if (Test-Path $NvidiaCudnnDir) {
         $PyInstallerArgs += @("--add-data", "$NvidiaCudnnDir;nvidia\cudnn")
@@ -297,7 +574,8 @@ Recommended first run
 
 Device behavior
 - OCR device and Translation device are separate settings.
-- The app auto-detects NVIDIA GPUs.
+- The app auto-detects NVIDIA GPUs for device selection.
+- The ZIP contains the Paddle runtime selected when it was built. Rebuild on the target PC if the GPU family is different.
 - If one GPU exists, the default is gpu:0.
 - If no GPU exists, the default is cpu.
 - If an invalid device such as gpu:1 is found on a one-GPU machine, it is corrected to gpu:0.

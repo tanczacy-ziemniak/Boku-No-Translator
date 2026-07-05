@@ -7,9 +7,12 @@ import multiprocessing as mp
 import os
 import queue
 import re
+import gc
+import subprocess
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -78,17 +81,88 @@ DEFAULT_CONFIG_PATH = RESOURCE_DIR / "config.yaml"
 CONFIG_PATH = USER_DATA_DIR / "config.yaml"
 BBOX_CONFIG_PATH = DEFAULT_CONFIG_PATH
 MODEL_CACHE_DIR = USER_DATA_DIR / "models"
+LOG_DIR = USER_DATA_DIR / "logs"
+APP_LOG_PATH = LOG_DIR / "app.log"
+PRELOAD_LOG_PATH = LOG_DIR / "preload_models.log"
+STDOUT_LOG_PATH = LOG_DIR / "stdout.log"
+STDERR_LOG_PATH = LOG_DIR / "stderr.log"
 APP_ICON_PATH = RESOURCE_DIR / "assets" / "app.ico"
 DEFAULT_JAPANESE_AUX_SYMBOL_CHARS = (
     "「 」 『 』 、。【 】 〈 〉 《 》 〔 〕 ［ ］ ｛ ｝"
 )
+DLL_DIRECTORY_HANDLES = []
+PRELOADED_DLL_HANDLES = []
+
+
+class SafeLogStream:
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def write(self, text):
+        if text is None:
+            return 0
+        text = str(text)
+        if not text:
+            return 0
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def ensure_stdio_streams():
+    if sys.stdout is None:
+        sys.stdout = SafeLogStream(STDOUT_LOG_PATH)
+    if sys.stderr is None:
+        sys.stderr = SafeLogStream(STDERR_LOG_PATH)
+
+
+def log_message(message: str):
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with APP_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
+
+
+def preload_message(message: str):
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with PRELOAD_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"{message}\n")
+    except Exception:
+        pass
+    try:
+        print(message, flush=True)
+    except Exception:
+        pass
 
 
 def configure_runtime_environment():
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_stdio_streams()
     os.environ.setdefault("HF_HOME", str(MODEL_CACHE_DIR / "huggingface"))
     os.environ.setdefault("HF_HUB_CACHE", str(MODEL_CACHE_DIR / "huggingface" / "hub"))
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    os.environ.setdefault("FLAGS_allocator_strategy", "auto_growth")
     os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(MODEL_CACHE_DIR / "paddlex"))
     os.environ.setdefault("PADDLE_HOME", str(MODEL_CACHE_DIR / "paddle"))
     os.environ.setdefault("PADDLEOCR_HOME", str(MODEL_CACHE_DIR / "paddleocr"))
@@ -100,6 +174,156 @@ def configure_runtime_environment():
         Path(os.environ["PADDLEOCR_HOME"]),
     ):
         cache_dir.mkdir(parents=True, exist_ok=True)
+
+
+def huggingface_hub_cache_dirs() -> list[Path]:
+    candidates = []
+    hf_hub_cache = os.environ.get("HF_HUB_CACHE")
+    if hf_hub_cache:
+        candidates.append(Path(hf_hub_cache))
+
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        candidates.append(Path(hf_home) / "hub")
+
+    candidates.append(MODEL_CACHE_DIR / "huggingface" / "hub")
+    candidates.append(Path.home() / ".cache" / "huggingface" / "hub")
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except Exception:
+            resolved = candidate.expanduser()
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(resolved)
+    return unique
+
+
+def find_cached_hf_file(repo_id: str, filename: str) -> Path | None:
+    repo_id = str(repo_id or "").strip()
+    filename = str(filename or "").strip().replace("\\", "/")
+    if not repo_id or not filename:
+        return None
+
+    repo_cache_name = "models--" + repo_id.replace("/", "--")
+    filename_parts = [part for part in filename.split("/") if part]
+    if not filename_parts:
+        return None
+
+    for hub_dir in huggingface_hub_cache_dirs():
+        snapshots_dir = hub_dir / repo_cache_name / "snapshots"
+        if not snapshots_dir.is_dir():
+            continue
+        for snapshot_dir in snapshots_dir.iterdir():
+            candidate = snapshot_dir.joinpath(*filename_parts)
+            try:
+                if candidate.is_file() and candidate.stat().st_size > 0:
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
+def add_dll_search_dir(path: Path):
+    if sys.platform != "win32":
+        return
+    path = Path(path)
+    if not path.exists() or not path.is_dir():
+        return
+    normalized = str(path.resolve())
+    if any(existing == normalized for existing, _ in DLL_DIRECTORY_HANDLES):
+        return
+    try:
+        handle = os.add_dll_directory(normalized)
+        DLL_DIRECTORY_HANDLES.append((normalized, handle))
+    except Exception:
+        return
+    current_path = os.environ.get("PATH", "")
+    if normalized.lower() not in [part.lower() for part in current_path.split(os.pathsep) if part]:
+        os.environ["PATH"] = normalized + os.pathsep + current_path
+
+
+def llama_cpp_runtime_roots() -> list[Path]:
+    roots = [
+        Path(sys.prefix) / "Lib" / "site-packages",
+        RESOURCE_DIR,
+        APP_DIR,
+        APP_DIR / "_internal",
+        executable_dir(),
+        executable_dir() / "_internal",
+        Path(__file__).resolve().parent,
+        Path(__file__).resolve().parent / "_internal",
+    ]
+    unique = []
+    seen = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            resolved = root
+        key = str(resolved).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+NVIDIA_ACCELERATOR_DLL_SUBDIRS = (
+    "bin",
+    "PySide6",
+    "shiboken6",
+    "nvidia/cublas/bin",
+    "nvidia/cuda_runtime/bin",
+    "nvidia/cudnn/bin",
+    "nvidia/cufft/bin",
+    "nvidia/curand/bin",
+    "nvidia/cusolver/bin",
+    "nvidia/cusparse/bin",
+    "nvidia/nvjitlink/bin",
+)
+
+
+def configure_accelerator_dlls():
+    if sys.platform != "win32":
+        return
+
+    roots = llama_cpp_runtime_roots()
+    for root in roots:
+        for rel in NVIDIA_ACCELERATOR_DLL_SUBDIRS:
+            add_dll_search_dir(root / rel)
+
+
+def configure_llama_cpp_dlls():
+    if sys.platform != "win32":
+        return
+
+    configure_accelerator_dlls()
+
+    roots = llama_cpp_runtime_roots()
+    for root in roots:
+        add_dll_search_dir(root / "llama_cpp" / "lib")
+
+    for root in roots:
+        lib_dir = root / "llama_cpp" / "lib"
+        if not lib_dir.exists():
+            continue
+        for dll_name in ("ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll", "ggml.dll", "llama.dll", "mtmd.dll"):
+            dll_path = lib_dir / dll_name
+            if not dll_path.exists():
+                continue
+            normalized = str(dll_path.resolve())
+            if any(existing == normalized for existing, _ in PRELOADED_DLL_HANDLES):
+                continue
+            try:
+                handle = ctypes.CDLL(normalized, winmode=ctypes.RTLD_GLOBAL)
+                PRELOADED_DLL_HANDLES.append((normalized, handle))
+            except Exception as exc:
+                print(f"[translate] DLL preload skipped: {dll_path.name}: {repr(exc)}", flush=True)
 
 
 def ensure_user_config_file():
@@ -117,6 +341,212 @@ def read_yaml_file(path: Path) -> dict:
         return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
+
+
+def run_hidden_command(args: list[str], timeout_sec: float = 5.0) -> subprocess.CompletedProcess | None:
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    except AttributeError:
+        flags = 0
+    try:
+        return subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+            creationflags=flags,
+        )
+    except Exception:
+        return None
+
+
+def nvidia_gpu_memory_summary() -> str:
+    query_args = ["--query-gpu=index,name,memory.used,memory.total", "--format=csv,noheader,nounits"]
+    rows = []
+    for exe in nvidia_smi_candidates():
+        result = run_hidden_command([exe, *query_args], timeout_sec=5.0)
+        if not result or result.returncode != 0:
+            continue
+        for line in result.stdout.splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 4:
+                continue
+            rows.append(f"gpu:{parts[0]} {parts[1]} mem={parts[2]}/{parts[3]}MB")
+        if rows:
+            return "; ".join(rows)
+    return "unavailable"
+
+
+def paddle_runtime_summary() -> list[str]:
+    lines = []
+    try:
+        import paddle
+    except Exception as exc:
+        return [f"paddle import failed: {type(exc).__name__}: {exc}"]
+
+    try:
+        lines.append(f"paddle version={getattr(paddle, '__version__', 'unknown')}")
+    except Exception:
+        pass
+    try:
+        lines.append(f"compiled_with_cuda={paddle.is_compiled_with_cuda()}")
+    except Exception as exc:
+        lines.append(f"compiled_with_cuda check failed: {type(exc).__name__}: {exc}")
+    try:
+        lines.append(f"cuda_device_count={paddle.device.cuda.device_count()}")
+    except Exception as exc:
+        lines.append(f"cuda_device_count failed: {type(exc).__name__}: {exc}")
+    try:
+        lines.append(f"current_device={paddle.device.get_device()}")
+    except Exception as exc:
+        lines.append(f"current_device failed: {type(exc).__name__}: {exc}")
+    try:
+        cuda_version = getattr(getattr(paddle, "version", None), "cuda", lambda: "")()
+        if cuda_version:
+            lines.append(f"paddle_cuda_version={cuda_version}")
+    except Exception:
+        pass
+    try:
+        cudnn_version = getattr(getattr(paddle, "version", None), "cudnn", lambda: "")()
+        if cudnn_version:
+            lines.append(f"paddle_cudnn_version={cudnn_version}")
+    except Exception:
+        pass
+    return lines or ["paddle runtime summary unavailable"]
+
+
+def paddle_gpu_device_candidates(device: str) -> list[str]:
+    normalized = str(device or "").strip().lower()
+    if not normalized.startswith("gpu"):
+        return [device]
+    candidates = [normalized]
+    if normalized == "gpu:0":
+        candidates.append("gpu")
+    elif normalized == "gpu":
+        candidates.append("gpu:0")
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def is_unsupported_gpu_architecture_error(exc: Exception) -> bool:
+    text = repr(exc).lower()
+    return "unsupported gpu architecture" in text or "no kernel image is available" in text or "sm_120" in text
+
+
+def unsupported_gpu_architecture_hint() -> str:
+    return (
+        "This usually means the bundled CUDA/Paddle runtime does not support the GPU architecture. "
+        "Rebuild on the target PC with build_app.ps1 so it can auto-detect the NVIDIA GPU compute capability, "
+        "or pass -PaddleGpuRuntime cuda118, cuda126, cuda129, or cpu explicitly. "
+        "RTX 50 / Blackwell GPUs such as RTX 5070 require the CUDA 12.9 Paddle runtime."
+    )
+
+
+def nvidia_smi_candidates() -> list[str]:
+    candidates = ["nvidia-smi"]
+    if sys.platform == "win32":
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        candidates.append(str(system_root / "System32" / "nvidia-smi.exe"))
+    return candidates
+
+
+def detect_gpu_infos() -> list[dict[str, Any]]:
+    query_args = ["--query-gpu=index,name", "--format=csv,noheader,nounits"]
+    for exe in nvidia_smi_candidates():
+        result = run_hidden_command([exe, *query_args], timeout_sec=5.0)
+        if not result or result.returncode != 0:
+            continue
+
+        infos: list[dict[str, Any]] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [part.strip() for part in line.split(",", 1)]
+            try:
+                index = int(parts[0])
+            except Exception:
+                continue
+            name = parts[1] if len(parts) > 1 else f"GPU {index}"
+            infos.append({"index": index, "name": name})
+        if infos:
+            infos.sort(key=lambda item: int(item.get("index", 0)))
+            return infos
+    return []
+
+
+def gpu_device_ids(gpu_infos: list[dict[str, Any]] | None = None) -> list[str]:
+    infos = detect_gpu_infos() if gpu_infos is None else gpu_infos
+    return [f"gpu:{int(info.get('index', 0))}" for info in infos]
+
+
+def normalize_compute_device(value: Any, available_gpu_devices: list[str] | None = None) -> str:
+    gpu_devices = [str(device) for device in (available_gpu_devices or []) if str(device).startswith("gpu:")]
+    normalized = str(value or "auto").strip().lower().replace("cuda:", "gpu:")
+    if normalized in {"", "auto", "gpu", "cuda"}:
+        return gpu_devices[0] if gpu_devices else "cpu"
+    if normalized in {"cpu", "none", "off"}:
+        return "cpu"
+    if normalized.startswith("gpu:"):
+        try:
+            requested_index = int(normalized.split(":", 1)[1])
+        except Exception:
+            requested_index = -1
+        requested = f"gpu:{requested_index}"
+        if requested in gpu_devices:
+            return requested
+        return gpu_devices[0] if gpu_devices else "cpu"
+    return gpu_devices[0] if gpu_devices else "cpu"
+
+
+def device_index(device: str) -> int:
+    try:
+        return int(str(device).split(":", 1)[1]) if str(device).startswith("gpu:") else 0
+    except Exception:
+        return 0
+
+
+def device_display_name(device: str, gpu_infos: list[dict[str, Any]] | None = None) -> str:
+    normalized = str(device or "cpu")
+    if normalized == "cpu":
+        return "CPU"
+    infos = detect_gpu_infos() if gpu_infos is None else gpu_infos
+    idx = device_index(normalized)
+    for info in infos:
+        if int(info.get("index", -1)) == idx:
+            name = str(info.get("name", "") or "").strip()
+            return f"{normalized} ({name})" if name else normalized
+    return normalized
+
+
+def configured_gpu_devices_from_dict(config_dict: dict) -> list[str]:
+    configured = [
+        str(device)
+        for device in config_dict.get("available_devices", [])
+        if str(device).startswith("gpu:")
+    ]
+    if configured:
+        return configured
+    return gpu_device_ids()
+
+
+def resolve_translation_device(config_dict: dict) -> str:
+    raw_device = str(config_dict.get("translation_device", "") or "").strip()
+    if not raw_device:
+        try:
+            raw_device = f"gpu:{int(config_dict.get('translation_device_index', 0))}"
+        except Exception:
+            raw_device = "auto"
+    return normalize_compute_device(raw_device, configured_gpu_devices_from_dict(config_dict))
 
 
 configure_runtime_environment()
@@ -214,6 +644,7 @@ class AppConfig:
     hide_overlay_during_capture: bool
     bbox_line_width: int
     bbox_draw_mode: str
+    model_status_overlay_enabled: bool
     show_ocr_text_box: bool
     text_box_font_size: int
     text_box_adaptive_font_size: bool
@@ -257,6 +688,7 @@ class AppConfig:
     translation_model_file: str
     translation_source_language: str
     translation_target_language: str
+    translation_device: str
     translation_device_index: int
     translation_n_ctx: int
     translation_n_gpu_layers: int
@@ -406,12 +838,30 @@ def load_config() -> AppConfig:
     else:
         translation_prompt_template = translation_prompt_template_for_target(translation_target_language)
 
+    detected_gpus = detect_gpu_infos()
+    available_gpu_devices = gpu_device_ids(detected_gpus)
+    selected_device = normalize_compute_device(cfg_get("selected_device", "auto"), available_gpu_devices)
+
+    raw_translation_device = str(cfg_get("translation_device", "") or "").strip()
+    if not raw_translation_device:
+        try:
+            raw_translation_device = f"gpu:{int(cfg_get('translation_device_index', 0))}"
+        except Exception:
+            raw_translation_device = "auto"
+    translation_device = normalize_compute_device(raw_translation_device, available_gpu_devices)
+    translation_device_index = device_index(translation_device)
+    translation_n_gpu_layers = int(cfg_get("translation_n_gpu_layers", -1))
+    if translation_device == "cpu":
+        translation_n_gpu_layers = 0
+    elif translation_n_gpu_layers == 0:
+        translation_n_gpu_layers = -1
+
     return AppConfig(
         paddle_lang=raw.get("paddle_lang", "en"),
         ocr_version=raw.get("ocr_version", "PP-OCRv6"),
         worker_mode=raw.get("worker_mode", "selected"),
-        selected_device=raw.get("selected_device", "gpu:0"),
-        available_devices=raw.get("available_devices", ["gpu:0", "gpu:1"]),
+        selected_device=selected_device,
+        available_devices=available_gpu_devices,
         capture_region=raw.get("capture_region", {"left": 0, "top": 0, "width": 2560, "height": 1440}),
         capture_mode=raw.get("capture_mode", "region"),
         capture_crop_enabled=bool(raw.get("capture_crop_enabled", False)),
@@ -485,6 +935,7 @@ def load_config() -> AppConfig:
         hide_overlay_during_capture=bool(raw.get("hide_overlay_during_capture", False)),
         bbox_line_width=int(raw.get("bbox_line_width", 2)),
         bbox_draw_mode=raw.get("bbox_draw_mode", "poly"),
+        model_status_overlay_enabled=bool(cfg_get("model_status_overlay_enabled", True)),
         show_ocr_text_box=bool(raw.get("show_ocr_text_box", True)),
         text_box_font_size=int(raw.get("text_box_font_size", 18)),
         text_box_adaptive_font_size=bool(raw.get("text_box_adaptive_font_size", True)),
@@ -528,9 +979,10 @@ def load_config() -> AppConfig:
         translation_model_file=str(cfg_get("translation_model_file", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf")),
         translation_source_language=str(cfg_get("translation_source_language", "ja")),
         translation_target_language=translation_target_language,
-        translation_device_index=int(cfg_get("translation_device_index", 0)),
+        translation_device=translation_device,
+        translation_device_index=translation_device_index,
         translation_n_ctx=int(cfg_get("translation_n_ctx", 2048)),
-        translation_n_gpu_layers=int(cfg_get("translation_n_gpu_layers", -1)),
+        translation_n_gpu_layers=translation_n_gpu_layers,
         translation_temperature=float(cfg_get("translation_temperature", 0.1)),
         translation_top_p=float(cfg_get("translation_top_p", 0.95)),
         translation_top_k=int(cfg_get("translation_top_k", 64)),
@@ -2099,6 +2551,8 @@ class LlamaCppGGUFTranslator:
         self.load_lock = threading.Lock()
         self.generate_lock = threading.Lock()
         self.llama = None
+        self.runtime_device = "unknown"
+        self.runtime_n_gpu_layers = 0
 
     def language_name(self, code: str) -> str:
         normalized = str(code or "").strip()
@@ -2146,6 +2600,45 @@ class LlamaCppGGUFTranslator:
 
         return path
 
+    def desired_device(self) -> str:
+        return resolve_translation_device(self.config)
+
+    def llama_kwargs_for_device(self, device: str) -> dict:
+        n_gpu_layers = int(self.config.get("translation_n_gpu_layers", -1))
+        if device == "cpu":
+            n_gpu_layers = 0
+        elif n_gpu_layers == 0:
+            n_gpu_layers = -1
+        return dict(
+            n_ctx=int(self.config.get("translation_n_ctx", 2048)),
+            n_gpu_layers=n_gpu_layers,
+            main_gpu=device_index(device),
+            verbose=False,
+        )
+
+    def load_llama(self, Llama, model_path: str, device: str):
+        kwargs = self.llama_kwargs_for_device(device)
+        log_message(f"[translate] loading GGUF on {device} n_gpu_layers={kwargs['n_gpu_layers']}: {model_path}")
+        llama = Llama(model_path=model_path, **kwargs)
+        self.runtime_device = device
+        self.runtime_n_gpu_layers = int(kwargs["n_gpu_layers"])
+        return llama
+
+    def close(self):
+        llama = self.llama
+        self.llama = None
+        self.loaded = False
+        if llama is None:
+            return
+        close_fn = getattr(llama, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception:
+                pass
+        del llama
+        gc.collect()
+
     def load(self):
         if self.loaded:
             return
@@ -2154,45 +2647,47 @@ class LlamaCppGGUFTranslator:
             if self.loaded:
                 return
 
-            if sys.platform == "win32":
-                candidates = [
-                    Path(sys.prefix) / "Lib" / "site-packages" / "llama_cpp" / "lib",
-                    Path(__file__).resolve().parent / ".venv" / "Lib" / "site-packages" / "llama_cpp" / "lib",
-                ]
-                for lib_dir in candidates:
-                    if lib_dir.exists():
-                        try:
-                            os.add_dll_directory(str(lib_dir))
-                        except Exception:
-                            pass
+            configure_llama_cpp_dlls()
 
             from llama_cpp import Llama
 
-            common_kwargs = dict(
-                n_ctx=int(self.config.get("translation_n_ctx", 2048)),
-                n_gpu_layers=int(self.config.get("translation_n_gpu_layers", -1)),
-                main_gpu=int(self.config.get("translation_device_index", 0)),
-                verbose=False,
-            )
+            desired_device = self.desired_device()
 
             model_path = self.model_path()
             if model_path:
                 print(f"[translate] loading GGUF: {model_path}", flush=True)
-                self.llama = Llama(model_path=model_path, **common_kwargs)
+                resolved_model_path = model_path
             else:
                 repo_id = str(self.config.get("translation_model_id", "") or "").strip()
                 filename = str(self.config.get("translation_model_file", "") or "").strip()
                 if not repo_id or not filename:
                     raise ValueError("translation_model_id and translation_model_file are required for llama_cpp_gguf")
 
-                print(f"[translate] downloading/loading GGUF: {repo_id} / {filename}", flush=True)
-                from huggingface_hub import hf_hub_download
+                cached_path = find_cached_hf_file(repo_id, filename)
+                if cached_path:
+                    print(f"[translate] loading cached GGUF: {cached_path}", flush=True)
+                    log_message(f"[translate] loading cached GGUF: {cached_path}")
+                    resolved_model_path = str(cached_path)
+                else:
+                    print(f"[translate] downloading/loading GGUF: {repo_id} / {filename}", flush=True)
+                    log_message(f"[translate] downloading/loading GGUF on {desired_device}: {repo_id} / {filename}")
+                    from huggingface_hub import hf_hub_download
 
-                downloaded_path = hf_hub_download(repo_id=repo_id, filename=filename)
-                self.llama = Llama(model_path=downloaded_path, **common_kwargs)
+                    downloaded_path = hf_hub_download(repo_id=repo_id, filename=filename)
+                    resolved_model_path = str(downloaded_path)
+
+            try:
+                self.llama = self.load_llama(Llama, resolved_model_path, desired_device)
+            except Exception:
+                if desired_device == "cpu":
+                    raise
+                log_message(f"[translate] GPU load failed on {desired_device}; trying CPU fallback:\n{traceback.format_exc()}")
+                print(f"[translate] GPU load failed on {desired_device}; trying CPU fallback", flush=True)
+                self.llama = self.load_llama(Llama, resolved_model_path, "cpu")
+                self.runtime_device = f"cpu(fallback:{desired_device})"
 
             self.loaded = True
-            print("[translate] GGUF ready", flush=True)
+            print(f"[translate] GGUF ready on {self.runtime_device}", flush=True)
 
     def build_prompt(self, text: str, context: str = "") -> str:
         source = self.language_name(str(self.config.get("translation_source_language", "auto")))
@@ -2695,6 +3190,13 @@ def get_result_dict(res: Any) -> dict:
     return {}
 
 
+def first_present_mapping_value(mapping: dict, *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return default
+
+
 def parse_paddle_v3_result(result: Any, min_conf: float, min_len: int, scale: int, region_left: int, region_top: int, frame_id: int, device: str, config_dict: dict):
     items = []
     if not isinstance(result, (list, tuple)):
@@ -2705,11 +3207,9 @@ def parse_paddle_v3_result(result: Any, min_conf: float, min_len: int, scale: in
         if not data:
             continue
 
-        texts = data.get("rec_texts") or data.get("texts") or []
-        scores = data.get("rec_scores") or data.get("scores") or []
-        locs = data.get("rec_polys") or data.get("dt_polys") or data.get("polys")
-        if locs is None:
-            locs = data.get("rec_boxes") or data.get("boxes")
+        texts = first_present_mapping_value(data, "rec_texts", "texts", default=[])
+        scores = first_present_mapping_value(data, "rec_scores", "scores", default=[])
+        locs = first_present_mapping_value(data, "rec_polys", "dt_polys", "polys", "rec_boxes", "boxes")
         if locs is None:
             continue
 
@@ -2836,6 +3336,38 @@ def predict_with_paddle(ocr, img, config_dict: dict):
     return ocr.ocr(img, cls=False), "v2"
 
 
+def warmup_paddle_ocr(ocr, config_dict: dict):
+    warmup_img = np.zeros((64, 64, 3), dtype=np.uint8)
+    predict_with_paddle(ocr, warmup_img, config_dict)
+
+
+def publish_model_status(out_q: mp.Queue, device: str, model: str, status: str, message: str = ""):
+    log_message(f"model_status device={device} model={model} status={status} message={message}")
+    try:
+        out_q.put(
+            {
+                "type": "model_status",
+                "device": device,
+                "model": model,
+                "status": status,
+                "message": message,
+            }
+        )
+    except Exception:
+        pass
+
+
+def preload_translation_model_status(translation_manager: SentenceTranslationManager, out_q: mp.Queue, device: str):
+    try:
+        translation_manager.translator.load()
+        runtime_device = str(getattr(translation_manager.translator, "runtime_device", device) or device)
+        status = "fallback" if "fallback:" in runtime_device else "ready"
+        publish_model_status(out_q, runtime_device, "translation", status, f"GGUF ready on {runtime_device}")
+    except Exception as exc:
+        log_message(f"translation preload failed on {device}:\n{traceback.format_exc()}")
+        publish_model_status(out_q, device, "translation", "error", repr(exc))
+
+
 
 def save_paddle_visualization(raw_result: Any, frame_id: int, device: str, config_dict: dict):
     # PaddleOCR Result 시각화 저장.
@@ -2891,26 +3423,85 @@ def save_paddle_visualization(raw_result: Any, frame_id: int, device: str, confi
 
 
 def ocr_worker_process(device: str, config_dict: dict, in_q: mp.Queue, out_q: mp.Queue):
+    requested_device = device
+    run_device = device
     try:
-        print(f"[{device}] PaddleOCR init...", flush=True)
-        ocr, _ = create_paddle_ocr(config_dict, device)
-        print(f"[{device}] PaddleOCR ready", flush=True)
+        configure_accelerator_dlls()
+        print(f"[{requested_device}] PaddleOCR init...", flush=True)
+        log_message(f"[{requested_device}] PaddleOCR init")
+        publish_model_status(out_q, requested_device, "ocr", "loading", "PaddleOCR loading")
+        try:
+            last_exc = None
+            for paddle_device in paddle_gpu_device_candidates(requested_device):
+                try:
+                    if paddle_device != requested_device:
+                        print(f"[{requested_device}] retrying PaddleOCR with device alias={paddle_device}", flush=True)
+                        log_message(f"[{requested_device}] retrying PaddleOCR with device alias={paddle_device}")
+                    ocr, _ = create_paddle_ocr(config_dict, paddle_device)
+                    warmup_paddle_ocr(ocr, config_dict)
+                    run_device = paddle_device
+                    break
+                except Exception as candidate_exc:
+                    last_exc = candidate_exc
+                    log_message(f"[{requested_device}] PaddleOCR init failed on {paddle_device}:\n{traceback.format_exc()}")
+                    print(f"[{requested_device}] PaddleOCR init failed on {paddle_device}: {repr(candidate_exc)}", flush=True)
+                    if is_unsupported_gpu_architecture_error(candidate_exc):
+                        hint = unsupported_gpu_architecture_hint()
+                        log_message(f"[{requested_device}] {hint}")
+                        print(f"[{requested_device}] {hint}", flush=True)
+                    ocr = None
+            else:
+                if last_exc is not None:
+                    raise last_exc
+                raise RuntimeError(f"PaddleOCR init failed on {requested_device}")
+        except Exception as gpu_exc:
+            if not str(requested_device).startswith("gpu"):
+                raise
+            run_device = "cpu"
+            print(f"[{requested_device}] PaddleOCR GPU init failed; trying CPU fallback: {repr(gpu_exc)}", flush=True)
+            publish_model_status(out_q, requested_device, "ocr", "loading", "GPU failed; trying CPU fallback")
+            ocr, _ = create_paddle_ocr(config_dict, run_device)
+            warmup_paddle_ocr(ocr, config_dict)
+
+        ready_message = "PaddleOCR ready" if run_device == requested_device else f"PaddleOCR ready on CPU fallback from {requested_device}"
+        ready_status = "ready" if run_device == requested_device else "fallback"
+        print(f"[{run_device}] {ready_message}", flush=True)
+        log_message(f"[{requested_device}] {ready_message}")
+        publish_model_status(out_q, requested_device, "ocr", ready_status, ready_message)
     except Exception as e:
-        out_q.put({"type": "error", "device": device, "message": f"init failed: {repr(e)}"})
+        tb = traceback.format_exc()
+        log_message(f"[{requested_device}] PaddleOCR init failed permanently:\n{tb}")
+        publish_model_status(out_q, requested_device, "ocr", "error", repr(e))
+        out_q.put({"type": "error", "device": requested_device, "message": f"init failed: {repr(e)}\n{tb}"})
         return
 
-    aux_ocr = create_japanese_aux_ocr(config_dict, device)
+    aux_ocr = create_japanese_aux_ocr(config_dict, run_device)
     translation_manager = None
     if bool(config_dict.get("enable_translation", True)):
         backend = str(config_dict.get("translation_backend", "llama_cpp_gguf") or "").strip().lower()
         if backend == "llama_cpp_gguf":
             translation_manager = SentenceTranslationManager(config_dict)
+            translation_device = resolve_translation_device(config_dict)
+            repo_id = str(config_dict.get("translation_model_id", "") or "").strip()
+            filename = str(config_dict.get("translation_model_file", "") or "").strip()
+            cached = bool(translation_manager.translator.model_path()) or bool(find_cached_hf_file(repo_id, filename))
+            loading_message = f"GGUF loading on {translation_device}" if cached else f"GGUF downloading/loading on {translation_device}"
+            publish_model_status(out_q, translation_device, "translation", "loading", loading_message)
+            threading.Thread(
+                target=preload_translation_model_status,
+                args=(translation_manager, out_q, translation_device),
+                daemon=True,
+            ).start()
         else:
+            publish_model_status(out_q, requested_device, "translation", "error", f"unsupported backend: {backend}")
             print(f"[translate] unsupported backend for this script: {backend}", flush=True)
+    else:
+        publish_model_status(out_q, requested_device, "translation", "disabled", "translation disabled")
 
     min_conf = float(config_dict["min_ocr_confidence"])
     min_len = int(config_dict.get("min_text_length", 2))
     scale = float(config_dict["ocr_scale"])
+    result_device = run_device if run_device == requested_device else f"{run_device}(fallback:{requested_device})"
 
     while True:
         job = in_q.get()
@@ -2927,34 +3518,35 @@ def ocr_worker_process(device: str, config_dict: dict, in_q: mp.Queue, out_q: mp
         start = time.perf_counter()
         try:
             raw_result, api_mode = predict_with_paddle(ocr, img, config_dict)
-            save_paddle_visualization(raw_result, frame_id, device, config_dict)
+            save_paddle_visualization(raw_result, frame_id, result_device, config_dict)
             if api_mode == "v3":
-                items = parse_paddle_v3_result(raw_result, min_conf, min_len, scale, region_left, region_top, frame_id, device, config_dict)
+                items = parse_paddle_v3_result(raw_result, min_conf, min_len, scale, region_left, region_top, frame_id, result_device, config_dict)
             else:
-                items = parse_paddle_v2_result(raw_result, min_conf, min_len, scale, region_left, region_top, frame_id, device, config_dict)
+                items = parse_paddle_v2_result(raw_result, min_conf, min_len, scale, region_left, region_top, frame_id, result_device, config_dict)
 
             items = merge_vertical_box_columns(items, config_dict)
-            items = merge_paddle_aux_symbols_only(items, ocr, img, scale, region_left, region_top, frame_id, device, config_dict)
-            items = refine_items_with_paddle_box_crops(items, ocr, img, scale, region_left, region_top, frame_id, device, config_dict)
+            items = merge_paddle_aux_symbols_only(items, ocr, img, scale, region_left, region_top, frame_id, result_device, config_dict)
+            items = refine_items_with_paddle_box_crops(items, ocr, img, scale, region_left, region_top, frame_id, result_device, config_dict)
 
             japanese_ocr_mode = str(config_dict.get("japanese_aux_ocr_mode", "symbol_only") or "symbol_only").strip().lower()
             if japanese_ocr_mode in {"symbol_only", "symbols", "punctuation_only", "punctuation", "quote_only", "quotes", "quote"}:
-                items = merge_japanese_aux_symbols_only(items, aux_ocr, img, scale, device, config_dict)
+                items = merge_japanese_aux_symbols_only(items, aux_ocr, img, scale, result_device, config_dict)
 
             sentence_groups = build_sentence_groups(items, config_dict)
-            print_sentence_groups(sentence_groups, config_dict, frame_id, device)
+            print_sentence_groups(sentence_groups, config_dict, frame_id, result_device)
             if translation_manager is not None:
-                items = translation_manager.annotate_and_print(items, sentence_groups, frame_id, device)
+                items = translation_manager.annotate_and_print(items, sentence_groups, frame_id, result_device)
 
             out_q.put({
                 "type": "result",
-                "device": device,
+                "device": result_device,
                 "frame_id": frame_id,
                 "elapsed_ms": (time.perf_counter() - start) * 1000.0,
                 "items": [asdict(i) for i in items],
             })
         except Exception as e:
-            out_q.put({"type": "error", "device": device, "message": repr(e)})
+            log_message(f"[{result_device}] OCR loop failed:\n{traceback.format_exc()}")
+            out_q.put({"type": "error", "device": result_device, "message": repr(e)})
 
 
 class BBoxOverlay(QWidget):
@@ -2963,6 +3555,10 @@ class BBoxOverlay(QWidget):
         self.config = config
         self.items = []
         self.bottom_caption_text = ""
+        self.model_statuses = {
+            "ocr": {"status": "unknown", "message": "", "device": ""},
+            "translation": {"status": "unknown", "message": "", "device": ""},
+        }
         region = config.capture_region
         self.current_region = None
 
@@ -2971,6 +3567,25 @@ class BBoxOverlay(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.update_region(region)
         self.apply_window_flags()
+
+    def model_status_overlay_enabled(self) -> bool:
+        return bool(getattr(self.config, "model_status_overlay_enabled", True))
+
+    def set_model_status(self, model: str, status: str, message: str = "", device: str = ""):
+        key = str(model or "").strip().lower()
+        if key in {"tr", "translate", "translator"}:
+            key = "translation"
+        if key not in self.model_statuses:
+            return
+        self.model_statuses[key] = {
+            "status": str(status or "unknown").strip().lower(),
+            "message": str(message or ""),
+            "device": str(device or ""),
+        }
+        if self.model_status_overlay_enabled() and not self.isVisible():
+            self.show()
+            self.raise_()
+        self.update()
 
     def update_region(self, region: dict):
         if not region:
@@ -3024,7 +3639,8 @@ class BBoxOverlay(QWidget):
                 break
 
         self.items = [item for item in items if self._is_drawable_item(item)]
-        if self.config.hide_when_no_bbox and not self.items and not self.bottom_caption_text:
+        has_status_overlay = self.model_status_overlay_enabled()
+        if self.config.hide_when_no_bbox and not self.items and not self.bottom_caption_text and not has_status_overlay:
             self.hide()
         else:
             if not self.isVisible():
@@ -3042,6 +3658,79 @@ class BBoxOverlay(QWidget):
             painter.drawPolygon(QPolygonF(points))
         else:
             painter.drawRect(int(item.rel_x), int(item.rel_y), int(item.w), int(item.h))
+
+    def _model_status_color(self, status: str) -> QColor:
+        normalized = str(status or "").strip().lower()
+        if normalized == "ready":
+            return QColor(46, 220, 115, 235)
+        if normalized == "fallback":
+            return QColor(255, 196, 54, 235)
+        if normalized == "error":
+            return QColor(255, 75, 75, 235)
+        return QColor(145, 150, 160, 220)
+
+    def _model_status_display_text(self, label: str, data: dict) -> str:
+        message = str(data.get("message", "") or "")
+        device = str(data.get("device", "") or "").strip()
+        if "fallback:" in message.lower() or "cpu fallback" in message.lower():
+            return f"{label} cpu fallback"
+        if " on " in message:
+            detail = message.rsplit(" on ", 1)[-1].strip()
+            if detail:
+                return f"{label} {detail}"
+        if device:
+            return f"{label} {device}"
+        return label
+
+    def _draw_model_status_overlay(self, painter: QPainter):
+        if not self.model_status_overlay_enabled():
+            return
+
+        rows = [
+            ("OCR", self.model_statuses.get("ocr", {})),
+            ("TR", self.model_statuses.get("translation", {})),
+        ]
+        display_rows = [(self._model_status_display_text(label, data), data) for label, data in rows]
+
+        painter.save()
+        font = QFont("Segoe UI")
+        font.setPixelSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+
+        dot_size = 8
+        row_h = 17
+        pad_x = 8
+        pad_y = 6
+        label_gap = 6
+        label_w = max(metrics.horizontalAdvance(label) for label, _ in display_rows)
+        rect_w = pad_x * 2 + dot_size + label_gap + label_w
+        rect_h = pad_y * 2 + row_h * len(rows)
+        rect = QRectF(8, 8, float(rect_w), float(rect_h))
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 135))
+        painter.drawRoundedRect(rect, 5, 5)
+
+        x = rect.left() + pad_x
+        y = rect.top() + pad_y
+        for label, data in display_rows:
+            status = str(data.get("status", "unknown") or "unknown")
+            dot_y = y + (row_h - dot_size) / 2.0
+            painter.setBrush(self._model_status_color(status))
+            painter.setPen(QColor(0, 0, 0, 150))
+            painter.drawEllipse(QRectF(float(x), float(dot_y), float(dot_size), float(dot_size)))
+
+            text_x = x + dot_size + label_gap
+            baseline_y = y + (row_h + metrics.ascent() - metrics.descent()) / 2.0
+            painter.setPen(QColor(0, 0, 0, 210))
+            painter.drawText(QPointF(float(text_x + 1), float(baseline_y + 1)), label)
+            painter.setPen(QColor(255, 255, 255, 235))
+            painter.drawText(QPointF(float(text_x), float(baseline_y)), label)
+            y += row_h
+
+        painter.restore()
 
     def _fit_text_lines(self, text: str, metrics: QFontMetrics, max_text_width: int):
         # OCR 텍스트가 긴 경우 박스 안에서 자동 줄바꿈합니다.
@@ -3362,7 +4051,7 @@ class BBoxOverlay(QWidget):
         painter.restore()
 
     def paintEvent(self, event):
-        if not self.items and not self.bottom_caption_text:
+        if not self.items and not self.bottom_caption_text and not self.model_status_overlay_enabled():
             return
 
         painter = QPainter(self)
@@ -3382,6 +4071,7 @@ class BBoxOverlay(QWidget):
             self._draw_text_box(painter, item)
 
         self._draw_bottom_caption(painter)
+        self._draw_model_status_overlay(painter)
 
     def render_demo_overlay_rgba(self) -> np.ndarray:
         pixmap = QPixmap(max(1, self.width()), max(1, self.height()))
@@ -3495,13 +4185,15 @@ class CaptureController:
         self.click_select_notice_printed = False
 
         self.active_devices = []
+        self.model_status_by_device = {}
         self.start_workers()
 
     def _active_devices_from_config(self) -> list[str]:
         if self.config.worker_mode == "selected":
-            active_devices = [self.config.selected_device]
+            active_devices = [normalize_compute_device(self.config.selected_device, self.config.available_devices)]
         else:
-            active_devices = list(self.config.available_devices)
+            active_devices = [normalize_compute_device(device, self.config.available_devices) for device in self.config.available_devices]
+        active_devices = [device for idx, device in enumerate(active_devices) if device and device not in active_devices[:idx]]
         return active_devices or ["cpu"]
 
     def start_workers(self):
@@ -3509,12 +4201,107 @@ class CaptureController:
         print("Active devices:", self.active_devices, flush=True)
         self.in_queues = []
         self.workers = []
+        self.reset_model_statuses()
         for device in self.active_devices:
             iq = mp.Queue(maxsize=1)
             proc = mp.Process(target=ocr_worker_process, args=(device, asdict(self.config), iq, self.out_q), daemon=True)
             proc.start()
             self.in_queues.append(iq)
             self.workers.append(proc)
+
+    def reset_model_statuses(self):
+        translation_enabled = bool(self.config.enable_translation)
+        backend = str(self.config.translation_backend or "").strip().lower()
+        if not translation_enabled:
+            translation_status = "disabled"
+            translation_message = "translation disabled"
+        elif backend != "llama_cpp_gguf":
+            translation_status = "error"
+            translation_message = f"unsupported backend: {backend}"
+        else:
+            translation_status = "loading"
+            translation_message = "GGUF loading"
+
+        self.model_status_by_device = {}
+        for device in self.active_devices:
+            self.model_status_by_device[str(device)] = {
+                "ocr": {"status": "loading", "message": "PaddleOCR loading", "device": str(device)},
+            }
+        translation_device = resolve_translation_device(asdict(self.config))
+        self.model_status_by_device.setdefault(str(translation_device), {})["translation"] = {
+            "status": translation_status,
+            "message": translation_message,
+            "device": str(translation_device),
+        }
+        self.update_overlay_model_status("ocr")
+        self.update_overlay_model_status("translation")
+
+    def aggregate_model_status(self, model: str) -> dict:
+        states = []
+        for device_status in self.model_status_by_device.values():
+            state = device_status.get(model)
+            if state:
+                states.append(state)
+
+        if not states:
+            return {"status": "unknown", "message": "", "device": ""}
+
+        statuses = [str(state.get("status", "unknown") or "unknown").lower() for state in states]
+        if any(status == "error" for status in statuses):
+            status = "error"
+        elif any(status == "loading" for status in statuses):
+            status = "loading"
+        elif any(status == "fallback" for status in statuses):
+            status = "fallback"
+        elif all(status == "ready" for status in statuses):
+            status = "ready"
+        elif all(status == "disabled" for status in statuses):
+            status = "disabled"
+        else:
+            status = "unknown"
+
+        messages = [
+            f"{state.get('device', '')}: {state.get('message', '')}".strip()
+            for state in states
+            if str(state.get("message", "") or "").strip()
+        ]
+        devices = [
+            str(state.get("device", "") or "").strip()
+            for state in states
+            if str(state.get("device", "") or "").strip()
+        ]
+        return {"status": status, "message": " | ".join(messages), "device": ",".join(devices)}
+
+    def update_overlay_model_status(self, model: str):
+        state = self.aggregate_model_status(model)
+        self.overlay.set_model_status(
+            model,
+            str(state.get("status", "unknown")),
+            str(state.get("message", "")),
+            str(state.get("device", "")),
+        )
+
+    def handle_model_status(self, msg: dict):
+        device = str(msg.get("device", "") or "")
+        model = str(msg.get("model", "") or "").strip().lower()
+        if model in {"tr", "translate", "translator"}:
+            model = "translation"
+        if model not in {"ocr", "translation"}:
+            return
+        if not device:
+            device = "default"
+
+        device_status = self.model_status_by_device.setdefault(device, {})
+        device_status[model] = {
+            "status": str(msg.get("status", "unknown") or "unknown").strip().lower(),
+            "message": str(msg.get("message", "") or ""),
+            "device": device,
+        }
+        print(
+            f"[model status] {device} {model}={device_status[model]['status']} {device_status[model]['message']}",
+            flush=True,
+        )
+        self.update_overlay_model_status(model)
 
     def restart_workers(self):
         self.stop(clear_overlay=False)
@@ -3672,6 +4459,10 @@ class CaptureController:
             except queue.Empty:
                 break
 
+            if msg.get("type") == "model_status":
+                self.handle_model_status(msg)
+                continue
+
             if msg.get("type") == "error":
                 print(f'{msg.get("device")}: ERROR {msg.get("message")}', flush=True)
                 self.overlay.set_items([])
@@ -3817,6 +4608,14 @@ APP_HELP_TEXT = {
         "1. 대상 창 선택을 눌러 OCR할 게임/앱 창을 고릅니다.\n"
         "2. 번역 오버레이는 선택한 창 위에 자동으로 표시됩니다.\n"
         "3. 데모가 필요하면 스크린샷 저장 또는 녹화 시작을 누릅니다.\n\n"
+        "처음 실행\n"
+        "- ZIP으로 받은 경우 preload_models.bat를 먼저 실행하면 OCR/번역 모델을 다운로드하고 로드까지 검증합니다.\n"
+        "- 번역 GGUF 모델은 수 GB라서 첫 다운로드가 오래 걸릴 수 있습니다.\n"
+        "- Python, venv, llama.cpp를 따로 설치할 필요는 없습니다. ZIP 패키지에 포함되어 있습니다.\n\n"
+        "장치 상태\n"
+        "- GPU가 있으면 기본은 gpu:0, 없으면 cpu입니다. 잘못된 gpu:1 값은 자동 보정됩니다.\n"
+        "- 설정에서 OCR device와 Translation device를 따로 지정할 수 있습니다.\n"
+        "- 초록색은 표시된 장치에서 준비 완료, 노란색은 CPU fallback, 회색은 로딩/다운로드, 빨간색은 실패입니다.\n\n"
         "단축키\n"
         "{toggle}: 이 패널 열기/숨기기\n"
         "{screenshot}: 대상 창 + 오버레이 스크린샷 저장\n"
@@ -3828,6 +4627,14 @@ APP_HELP_TEXT = {
         "1. Click Select Target Window and choose the game/app window.\n"
         "2. The translated overlay follows the selected window.\n"
         "3. Use Save Screenshot or Start Recording for demos.\n\n"
+        "First run\n"
+        "- If you use the ZIP package, run preload_models.bat first to download and verify OCR/translation models.\n"
+        "- The GGUF translation model is several GB, so the first download can take a long time.\n"
+        "- Python, venv, and llama.cpp do not need to be installed separately. They are bundled in the ZIP package.\n\n"
+        "Device status\n"
+        "- If a GPU exists, the default is gpu:0; otherwise it is cpu. Invalid values like gpu:1 are corrected automatically.\n"
+        "- OCR device and Translation device can be assigned separately in Settings.\n"
+        "- Green means ready on the shown device, yellow means CPU fallback, gray means loading/downloading, red means failed.\n\n"
         "Hotkeys\n"
         "{toggle}: show/hide this panel\n"
         "{screenshot}: save target window + overlay screenshot\n"
@@ -4106,6 +4913,8 @@ class ControlPanel(QWidget):
         self.help_label.setWordWrap(True)
         self.translation_language_note_label = QLabel()
         self.translation_language_note_label.setWordWrap(True)
+        self.device_note_label = QLabel()
+        self.device_note_label.setWordWrap(True)
         self.source_language_label = QLabel()
         self.target_language_label = QLabel()
         self.ui_language_label = QLabel()
@@ -4134,12 +4943,16 @@ class ControlPanel(QWidget):
         self.horizontal_require_continuation_checkbox.setChecked(bool(self.config.horizontal_sentence_require_continuation))
 
         self.gpu_combo = QComboBox()
+        self.translation_device_combo = QComboBox()
         device_options = ["cpu"] + [str(d) for d in self.config.available_devices if str(d) != "cpu"]
-        if self.config.selected_device not in device_options:
-            device_options.append(self.config.selected_device)
+        for current_device in (self.config.selected_device, self.config.translation_device):
+            if current_device not in device_options:
+                device_options.append(current_device)
         for device in device_options:
-            self.gpu_combo.addItem(device, device)
+            self.gpu_combo.addItem(device_display_name(device), device)
+            self.translation_device_combo.addItem(device_display_name(device), device)
         self.gpu_combo.setCurrentIndex(max(0, self.gpu_combo.findData(self.config.selected_device)))
+        self.translation_device_combo.setCurrentIndex(max(0, self.translation_device_combo.findData(self.config.translation_device)))
 
         self.ocr_det_model_edit = QLineEdit(self.config.ocr_text_detection_model_dir)
         self.ocr_rec_model_edit = QLineEdit(self.config.ocr_text_recognition_model_dir)
@@ -4236,7 +5049,9 @@ class ControlPanel(QWidget):
         form.addRow(self.output_button)
         form.addRow("OCR scale", self.ocr_scale_spin)
         form.addRow("min_ocr_confidence", self.min_conf_spin)
-        form.addRow("GPU / Device", self.gpu_combo)
+        form.addRow(self.device_note_label)
+        form.addRow("OCR device", self.gpu_combo)
+        form.addRow("Translation device", self.translation_device_combo)
         form.addRow("text_det_thresh", self.det_thresh_spin)
         form.addRow("text_det_box_thresh", self.det_box_thresh_spin)
         form.addRow("text_det_unclip_ratio", self.unclip_spin)
@@ -4305,8 +5120,16 @@ class ControlPanel(QWidget):
         self.config.min_ocr_confidence = float(self.min_conf_spin.value())
         self.config.worker_mode = "selected"
         self.config.selected_device = str(self.gpu_combo.currentData() or self.gpu_combo.currentText() or "cpu")
+        self.config.translation_device = str(self.translation_device_combo.currentData() or self.translation_device_combo.currentText() or "cpu")
+        self.config.translation_device_index = device_index(self.config.translation_device)
+        if self.config.translation_device == "cpu":
+            self.config.translation_n_gpu_layers = 0
+        elif self.config.translation_n_gpu_layers == 0:
+            self.config.translation_n_gpu_layers = -1
         if self.config.selected_device not in self.config.available_devices and self.config.selected_device != "cpu":
             self.config.available_devices.append(self.config.selected_device)
+        if self.config.translation_device not in self.config.available_devices and self.config.translation_device != "cpu":
+            self.config.available_devices.append(self.config.translation_device)
         self.config.text_det_thresh = float(self.det_thresh_spin.value())
         self.config.text_det_box_thresh = float(self.det_box_thresh_spin.value())
         self.config.text_det_unclip_ratio = float(self.unclip_spin.value())
@@ -4335,6 +5158,9 @@ class ControlPanel(QWidget):
                 "worker_mode": self.config.worker_mode,
                 "selected_device": self.config.selected_device,
                 "available_devices": self.config.available_devices,
+                "translation_device": self.config.translation_device,
+                "translation_device_index": self.config.translation_device_index,
+                "translation_n_gpu_layers": self.config.translation_n_gpu_layers,
                 "text_det_thresh": self.config.text_det_thresh,
                 "text_det_box_thresh": self.config.text_det_box_thresh,
                 "text_det_unclip_ratio": self.config.text_det_unclip_ratio,
@@ -4382,6 +5208,10 @@ class ControlPanel(QWidget):
         self.apply_button.setText(app_text(self.config, "apply_settings"))
         self.language_apply_button.setText(app_text(self.config, "apply_settings"))
         self.translation_language_note_label.setText(app_text(self.config, "translation_language_note"))
+        self.device_note_label.setText(
+            f"Detected GPUs: {', '.join(device_display_name(d) for d in self.config.available_devices) if self.config.available_devices else 'none'} | "
+            f"OCR: {device_display_name(self.config.selected_device)} | TR: {device_display_name(self.config.translation_device)}"
+        )
         self.source_language_label.setText(app_text(self.config, "ocr_source_language"))
         self.target_language_label.setText(app_text(self.config, "translation_target_language"))
         self.ui_language_label.setText(app_text(self.config, "ui_language"))
@@ -4535,66 +5365,118 @@ class TrayRuntime:
 
 def preload_translation_model(config: AppConfig):
     if not config.enable_translation:
-        print("[preload] translation disabled; skipping GGUF download", flush=True)
+        preload_message("[preload] translation disabled; skipping GGUF download")
         return
     if str(config.translation_backend or "").strip().lower() != "llama_cpp_gguf":
-        print(f"[preload] translation backend is {config.translation_backend}; skipping GGUF download", flush=True)
+        preload_message(f"[preload] translation backend is {config.translation_backend}; skipping GGUF download")
         return
 
     config_dict = asdict(config)
     translator = LlamaCppGGUFTranslator(config_dict)
+    translation_device = resolve_translation_device(config_dict)
+    preload_message(f"[preload] preparing GGUF translation model on {translation_device}")
     local_path = translator.model_path()
     if local_path:
         candidate = Path(local_path)
         if candidate.is_file():
-            print(f"[preload] GGUF already available: {candidate}", flush=True)
-            return
-        raise FileNotFoundError(f"translation_model_path does not exist: {local_path}")
+            preload_message(f"[preload] GGUF already available: {candidate}")
+        else:
+            raise FileNotFoundError(f"translation_model_path does not exist: {local_path}")
 
-    repo_id = str(config.translation_model_id or "").strip()
-    filename = str(config.translation_model_file or "").strip()
-    if not repo_id or not filename:
-        raise ValueError("translation_model_id and translation_model_file are required")
+    if not local_path:
+        repo_id = str(config.translation_model_id or "").strip()
+        filename = str(config.translation_model_file or "").strip()
+        if not repo_id or not filename:
+            raise ValueError("translation_model_id and translation_model_file are required")
 
-    print(f"[preload] downloading GGUF: {repo_id} / {filename}", flush=True)
-    from huggingface_hub import hf_hub_download
+        cached_path = find_cached_hf_file(repo_id, filename)
+        if cached_path:
+            preload_message(f"[preload] GGUF already cached: {cached_path}")
+        else:
+            preload_message(f"[preload] downloading GGUF: {repo_id} / {filename}")
+            from huggingface_hub import hf_hub_download
 
-    downloaded = hf_hub_download(repo_id=repo_id, filename=filename)
-    print(f"[preload] GGUF cached: {downloaded}", flush=True)
+            downloaded = hf_hub_download(repo_id=repo_id, filename=filename)
+            preload_message(f"[preload] GGUF cached: {downloaded}")
+
+    try:
+        translator.load()
+        preload_message(f"[preload] GGUF ready ({translator.runtime_device})")
+    finally:
+        translator.close()
+        preload_message(f"[preload] GPU memory after GGUF verification cleanup: {nvidia_gpu_memory_summary()}")
 
 
 def preload_paddle_models(config: AppConfig):
     config_dict = asdict(config)
     if not str(config_dict.get("paddle_lang", "") or "").strip():
         config_dict["paddle_lang"] = "en"
-    device = str(config_dict.get("selected_device", "cpu") or "cpu")
-    print(f"[preload] preparing PaddleOCR models for lang={config_dict['paddle_lang']} device={device}", flush=True)
-    ocr, api_version = create_paddle_ocr(config_dict, device)
+    device = normalize_compute_device(config_dict.get("selected_device", "auto"), config_dict.get("available_devices", []))
+    configure_accelerator_dlls()
+    preload_message(f"[preload] preparing PaddleOCR models for lang={config_dict['paddle_lang']} device={device}")
+    preload_message(f"[preload] GPU memory before PaddleOCR init: {nvidia_gpu_memory_summary()}")
+    for line in paddle_runtime_summary():
+        preload_message(f"[preload] {line}")
+    try:
+        last_exc = None
+        tried_devices = []
+        for paddle_device in paddle_gpu_device_candidates(device):
+            tried_devices.append(paddle_device)
+            try:
+                if paddle_device != device:
+                    preload_message(f"[preload] retrying PaddleOCR with device alias={paddle_device}")
+                ocr, api_version = create_paddle_ocr(config_dict, paddle_device)
+                warmup_paddle_ocr(ocr, config_dict)
+                device = paddle_device
+                break
+            except Exception as candidate_exc:
+                last_exc = candidate_exc
+                log_message(f"[preload] PaddleOCR init failed on {paddle_device}:\n{traceback.format_exc()}")
+                preload_message(f"[preload] PaddleOCR GPU init failed on {paddle_device}: {type(candidate_exc).__name__}: {candidate_exc}")
+                if is_unsupported_gpu_architecture_error(candidate_exc):
+                    preload_message(f"[preload] {unsupported_gpu_architecture_hint()}")
+                ocr = None
+        else:
+            if last_exc is not None:
+                raise last_exc
+            raise RuntimeError(f"PaddleOCR init failed for devices: {tried_devices}")
+    except Exception as exc:
+        if not str(device).startswith("gpu"):
+            raise
+        preload_message(f"[preload] GPU memory at PaddleOCR failure: {nvidia_gpu_memory_summary()}")
+        preload_message("[preload] trying CPU fallback")
+        ocr, api_version = create_paddle_ocr(config_dict, "cpu")
+        warmup_paddle_ocr(ocr, config_dict)
+        device = "cpu"
     del ocr
-    print(f"[preload] PaddleOCR ready ({api_version})", flush=True)
+    preload_message(f"[preload] PaddleOCR ready ({api_version}, device={device})")
 
 
 def preload_models() -> int:
+    try:
+        PRELOAD_LOG_PATH.unlink()
+    except Exception:
+        pass
     config = load_config()
-    print(f"[preload] app data: {USER_DATA_DIR}", flush=True)
-    print(f"[preload] model cache: {MODEL_CACHE_DIR}", flush=True)
-    print(f"[preload] config: {CONFIG_PATH}", flush=True)
+    preload_message(f"[preload] app data: {USER_DATA_DIR}")
+    preload_message(f"[preload] model cache: {MODEL_CACHE_DIR}")
+    preload_message(f"[preload] config: {CONFIG_PATH}")
 
     errors = []
-    for step in (preload_translation_model, preload_paddle_models):
+    for step in (preload_paddle_models, preload_translation_model):
         try:
             step(config)
         except Exception as exc:
             errors.append(f"{step.__name__}: {repr(exc)}")
-            print(f"[preload] failed: {step.__name__}: {repr(exc)}", flush=True)
+            preload_message(f"[preload] failed: {step.__name__}: {repr(exc)}")
 
     if errors:
-        print("[preload] completed with errors:", flush=True)
+        preload_message("[preload] completed with errors:")
         for error in errors:
-            print(f"  - {error}", flush=True)
+            preload_message(f"  - {error}")
         return 1
 
-    print("[preload] all configured models are ready", flush=True)
+    preload_message("[preload] All configured models are ready.")
     return 0
 
 
