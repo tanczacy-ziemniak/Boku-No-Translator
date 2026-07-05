@@ -27,8 +27,6 @@
 ## Description
 Real-time translator for games powered by local OCR and a local AI translation model.
 
-
-
 ## Demo
 
 <p align="center">
@@ -149,35 +147,16 @@ For RTX 5070 / 5080 / 5090 systems, copy and paste this in powershell:
 .\build_app.ps1 -PaddleGpuRuntime cuda129 -LlamaCudaInstallMode source -RequireLlamaCuda
 ```
 
-For RTX 50 / Blackwell systems, `-LlamaCudaInstallMode auto` selects source build because the standard `llama-cpp-python` CUDA wheel index does not currently provide a CUDA 12.8/12.9 Windows wheel. If the build cannot install Visual Studio Build Tools or CUDA Toolkit automatically, install those once and rerun the same command. By default, CUDA llama verification failure is a warning; add `-RequireLlamaCuda` when you want the build to fail unless GPU offload is verified.
-
-The packaged ZIP contains one Paddle runtime selected at build time. If you build on one GPU family and move the ZIP to a very different GPU family, rebuild on the target PC or pass the matching `-PaddleGpuRuntime` option.
-
-Create the release ZIP and package folder:
-
-```powershell
-.\build_installer.ps1 -SkipSetupExe
-```
-
-The installer build forwards the same Paddle runtime selector:
-
-```powershell
-.\build_installer.ps1 -PaddleGpuRuntime cuda129
-.\build_installer.ps1 -PaddleGpuRuntime cuda129 -LlamaCudaInstallMode source
-.\build_installer.ps1 -PaddleGpuRuntime cuda118 -LlamaCudaInstallMode wheel -SkipSetupExe
-```
-
 The app executable is created at:
 
 ```text
 dist\boku-no-translator\boku-no-translator.exe
 ```
 
-The ZIP is created at:
+before to execute ```boku-no-translator.exe```,
 
-```text
-release\boku-no-translator-package-fixed.zip
-```
+execute ```dist\boku-no-translator\preload_models.bat``` first.
+
 
 ## Hotkeys
 
