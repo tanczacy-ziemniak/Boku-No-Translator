@@ -31,9 +31,31 @@ $RootDir = Split-Path -Parent $AppDir
 $VenvDir = Join-Path $RootDir ".venv"
 $Python = Join-Path $VenvDir "Scripts\python.exe"
 $SitePackages = Join-Path $VenvDir "Lib\site-packages"
-$NvidiaCudnnDir = Join-Path $SitePackages "nvidia\cudnn"
+$NvidiaPackageDir = Join-Path $SitePackages "nvidia"
 $LlamaLibDir = Join-Path $SitePackages "llama_cpp\lib"
 $SitePackagesBinDir = Join-Path $SitePackages "bin"
+$NvidiaRuntimeDirs = @(
+    "cublas",
+    "cuda_nvrtc",
+    "cuda_runtime",
+    "cudnn",
+    "cufft",
+    "curand",
+    "cusolver",
+    "cusparse",
+    "nvjitlink"
+)
+$NvidiaRuntimePackages = @(
+    "nvidia-cublas-cu12",
+    "nvidia-cuda-nvrtc-cu12",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-curand-cu12",
+    "nvidia-cusolver-cu12",
+    "nvidia-cusparse-cu12",
+    "nvidia-nvjitlink-cu12"
+)
 
 function Find-Python311 {
     $Candidates = @(
@@ -644,6 +666,7 @@ subdirs = [
     "llama_cpp/lib",
     "bin",
     "nvidia/cublas/bin",
+    "nvidia/cuda_nvrtc/bin",
     "nvidia/cuda_runtime/bin",
     "nvidia/cudnn/bin",
     "nvidia/cufft/bin",
@@ -784,6 +807,7 @@ function Install-CudaPythonPackages {
         Write-Host "Installing CUDA 12.9 Python runtime packages for Blackwell/RTX 50..."
         & $Python -m pip install --upgrade `
             nvidia-cublas-cu12==12.9.2.10 `
+            nvidia-cuda-nvrtc-cu12==12.9.86 `
             nvidia-cuda-runtime-cu12==12.9.79 `
             nvidia-cudnn-cu12==9.9.0.52 `
             nvidia-cufft-cu12==11.4.1.4 `
@@ -795,6 +819,7 @@ function Install-CudaPythonPackages {
         Write-Host "Installing CUDA runtime Python packages used by the bundled app..."
         & $Python -m pip install --upgrade `
             nvidia-cublas-cu12 `
+            nvidia-cuda-nvrtc-cu12 `
             nvidia-cuda-runtime-cu12 `
             nvidia-cudnn-cu12 `
             nvidia-cufft-cu12 `
@@ -842,8 +867,15 @@ function Assert-GpuBuildInputs {
         Write-Host "CPU Paddle runtime selected. Skipping CUDA build input assertions."
         return
     }
-    if (-not (Test-Path $NvidiaCudnnDir)) {
-        throw "nvidia-cudnn-cu12 was not found after automatic installation: $NvidiaCudnnDir"
+    $MissingRuntimeDirs = @()
+    foreach ($RuntimeDir in $NvidiaRuntimeDirs) {
+        $RuntimePath = Join-Path $NvidiaPackageDir $RuntimeDir
+        if (-not (Test-Path $RuntimePath)) {
+            $MissingRuntimeDirs += $RuntimePath
+        }
+    }
+    if ($MissingRuntimeDirs.Count -gt 0) {
+        throw "Required NVIDIA CUDA runtime package files were not found after automatic installation: $($MissingRuntimeDirs -join ', ')"
     }
     if ($LlamaCudaInstallMode -eq "skip") {
         Write-Warning "CUDA llama.cpp verification was skipped by request."
@@ -909,15 +941,41 @@ try {
         "--hidden-import", "paddlex",
         "--hidden-import", "llama_cpp",
         "--hidden-import", "huggingface_hub",
+        "--exclude-module", "PySide6.scripts",
+        "--exclude-module", "PySide6.scripts.deploy_lib",
+        "--exclude-module", "paddle.tensorrt",
+        "--exclude-module", "paddleocr._doc2md",
+        "--exclude-module", "paddleocr._doc2md.math",
+        "--exclude-module", "paddlex.inference.serving",
+        "--exclude-module", "modelscope.trainers",
+        "--exclude-module", "modelscope.trainers.parallel",
+        "--exclude-module", "modelscope.metrics",
+        "--exclude-module", "modelscope.ops",
+        "--exclude-module", "modelscope.server",
+        "--exclude-module", "ascii__mypyc",
+        "--exclude-module", "confusion__mypyc",
+        "--exclude-module", "escape__mypyc",
+        "--exclude-module", "magic__mypyc",
+        "--exclude-module", "orchestrator__mypyc",
+        "--exclude-module", "statistical__mypyc",
+        "--exclude-module", "structural__mypyc",
+        "--exclude-module", "utf1632__mypyc",
+        "--exclude-module", "utf8__mypyc",
+        "--exclude-module", "validity__mypyc",
         "--exclude-module", "torch",
         "--exclude-module", "torchvision",
         "--exclude-module", "torchaudio",
         "--exclude-module", "tensorflow"
     )
-    if (Test-Path $NvidiaCudnnDir) {
-        $PyInstallerArgs += @("--add-data", "$NvidiaCudnnDir;nvidia\cudnn")
-        if (Test-PythonPackage "nvidia-cudnn-cu12") {
-            $PyInstallerArgs += @("--copy-metadata", "nvidia-cudnn-cu12")
+    foreach ($RuntimeDir in $NvidiaRuntimeDirs) {
+        $RuntimePath = Join-Path $NvidiaPackageDir $RuntimeDir
+        if (Test-Path $RuntimePath) {
+            $PyInstallerArgs += @("--add-data", "$RuntimePath;nvidia\$RuntimeDir")
+        }
+    }
+    foreach ($PackageName in $NvidiaRuntimePackages) {
+        if (Test-PythonPackage $PackageName) {
+            $PyInstallerArgs += @("--copy-metadata", $PackageName)
         }
     }
     $PyInstallerArgs += @("app.py")

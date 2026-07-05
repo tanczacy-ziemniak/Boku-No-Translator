@@ -278,6 +278,7 @@ NVIDIA_ACCELERATOR_DLL_SUBDIRS = (
     "PySide6",
     "shiboken6",
     "nvidia/cublas/bin",
+    "nvidia/cuda_nvrtc/bin",
     "nvidia/cuda_runtime/bin",
     "nvidia/cudnn/bin",
     "nvidia/cufft/bin",
