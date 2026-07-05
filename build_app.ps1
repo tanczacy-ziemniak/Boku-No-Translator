@@ -693,8 +693,15 @@ except Exception:
     $StderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ("boku_llama_probe_{0}.err" -f ([Guid]::NewGuid().ToString("N")))
     try {
         Set-Content -LiteralPath $ProbePath -Value $Probe -Encoding UTF8
-        & $Python $ProbePath 1>$StdoutPath 2>$StderrPath
-        $ExitCode = $LASTEXITCODE
+        $Process = Start-Process `
+            -FilePath $Python `
+            -ArgumentList @($ProbePath) `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $StdoutPath `
+            -RedirectStandardError $StderrPath
+        $ExitCode = $Process.ExitCode
         foreach ($Path in @($StdoutPath, $StderrPath)) {
             if (Test-Path $Path) {
                 foreach ($Line in (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
