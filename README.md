@@ -9,6 +9,10 @@
 </p>
 
 <p align="center">
+  Don't forget to Star ⭐️ this repository to keep track of updates!
+</p>
+
+<p align="center">
   <img src="./assets/readme-hero.png" width="100%" alt="Boku No Translator banner">
 </p>
 
@@ -22,7 +26,7 @@
 
 ## Description
 Real-time translator for games powered by local OCR and a local AI translation model.
-Don't forget to Star ⭐️ this repository to keep track of updates!
+
 
 
 ## Demo
