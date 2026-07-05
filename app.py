@@ -7,6 +7,7 @@ import multiprocessing as mp
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -81,6 +82,7 @@ BBOX_CONFIG_PATH = DEFAULT_CONFIG_PATH
 MODEL_CACHE_DIR = USER_DATA_DIR / "models"
 LOG_DIR = USER_DATA_DIR / "logs"
 APP_LOG_PATH = LOG_DIR / "app.log"
+PRELOAD_LOG_PATH = LOG_DIR / "preload_models.log"
 APP_ICON_PATH = RESOURCE_DIR / "assets" / "app.ico"
 DEFAULT_JAPANESE_AUX_SYMBOL_CHARS = (
     "「 」 『 』 、。【 】 〈 〉 《 》 〔 〕 ［ ］ ｛ ｝"
@@ -95,6 +97,16 @@ def log_message(message: str):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         with APP_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
+
+
+def preload_message(message: str):
+    print(message, flush=True)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with PRELOAD_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(f"{message}\n")
     except Exception:
         pass
 
@@ -285,6 +297,124 @@ def read_yaml_file(path: Path) -> dict:
         return {}
 
 
+def run_hidden_command(args: list[str], timeout_sec: float = 5.0) -> subprocess.CompletedProcess | None:
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    except AttributeError:
+        flags = 0
+    try:
+        return subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+            creationflags=flags,
+        )
+    except Exception:
+        return None
+
+
+def nvidia_smi_candidates() -> list[str]:
+    candidates = ["nvidia-smi"]
+    if sys.platform == "win32":
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        candidates.append(str(system_root / "System32" / "nvidia-smi.exe"))
+    return candidates
+
+
+def detect_gpu_infos() -> list[dict[str, Any]]:
+    query_args = ["--query-gpu=index,name", "--format=csv,noheader,nounits"]
+    for exe in nvidia_smi_candidates():
+        result = run_hidden_command([exe, *query_args], timeout_sec=5.0)
+        if not result or result.returncode != 0:
+            continue
+
+        infos: list[dict[str, Any]] = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = [part.strip() for part in line.split(",", 1)]
+            try:
+                index = int(parts[0])
+            except Exception:
+                continue
+            name = parts[1] if len(parts) > 1 else f"GPU {index}"
+            infos.append({"index": index, "name": name})
+        if infos:
+            infos.sort(key=lambda item: int(item.get("index", 0)))
+            return infos
+    return []
+
+
+def gpu_device_ids(gpu_infos: list[dict[str, Any]] | None = None) -> list[str]:
+    infos = detect_gpu_infos() if gpu_infos is None else gpu_infos
+    return [f"gpu:{int(info.get('index', 0))}" for info in infos]
+
+
+def normalize_compute_device(value: Any, available_gpu_devices: list[str] | None = None) -> str:
+    gpu_devices = [str(device) for device in (available_gpu_devices or []) if str(device).startswith("gpu:")]
+    normalized = str(value or "auto").strip().lower().replace("cuda:", "gpu:")
+    if normalized in {"", "auto", "gpu", "cuda"}:
+        return gpu_devices[0] if gpu_devices else "cpu"
+    if normalized in {"cpu", "none", "off"}:
+        return "cpu"
+    if normalized.startswith("gpu:"):
+        try:
+            requested_index = int(normalized.split(":", 1)[1])
+        except Exception:
+            requested_index = -1
+        requested = f"gpu:{requested_index}"
+        if requested in gpu_devices:
+            return requested
+        return gpu_devices[0] if gpu_devices else "cpu"
+    return gpu_devices[0] if gpu_devices else "cpu"
+
+
+def device_index(device: str) -> int:
+    try:
+        return int(str(device).split(":", 1)[1]) if str(device).startswith("gpu:") else 0
+    except Exception:
+        return 0
+
+
+def device_display_name(device: str, gpu_infos: list[dict[str, Any]] | None = None) -> str:
+    normalized = str(device or "cpu")
+    if normalized == "cpu":
+        return "CPU"
+    infos = detect_gpu_infos() if gpu_infos is None else gpu_infos
+    idx = device_index(normalized)
+    for info in infos:
+        if int(info.get("index", -1)) == idx:
+            name = str(info.get("name", "") or "").strip()
+            return f"{normalized} ({name})" if name else normalized
+    return normalized
+
+
+def configured_gpu_devices_from_dict(config_dict: dict) -> list[str]:
+    configured = [
+        str(device)
+        for device in config_dict.get("available_devices", [])
+        if str(device).startswith("gpu:")
+    ]
+    if configured:
+        return configured
+    return gpu_device_ids()
+
+
+def resolve_translation_device(config_dict: dict) -> str:
+    raw_device = str(config_dict.get("translation_device", "") or "").strip()
+    if not raw_device:
+        try:
+            raw_device = f"gpu:{int(config_dict.get('translation_device_index', 0))}"
+        except Exception:
+            raw_device = "auto"
+    return normalize_compute_device(raw_device, configured_gpu_devices_from_dict(config_dict))
+
+
 configure_runtime_environment()
 
 
@@ -424,6 +554,7 @@ class AppConfig:
     translation_model_file: str
     translation_source_language: str
     translation_target_language: str
+    translation_device: str
     translation_device_index: int
     translation_n_ctx: int
     translation_n_gpu_layers: int
@@ -573,12 +704,30 @@ def load_config() -> AppConfig:
     else:
         translation_prompt_template = translation_prompt_template_for_target(translation_target_language)
 
+    detected_gpus = detect_gpu_infos()
+    available_gpu_devices = gpu_device_ids(detected_gpus)
+    selected_device = normalize_compute_device(cfg_get("selected_device", "auto"), available_gpu_devices)
+
+    raw_translation_device = str(cfg_get("translation_device", "") or "").strip()
+    if not raw_translation_device:
+        try:
+            raw_translation_device = f"gpu:{int(cfg_get('translation_device_index', 0))}"
+        except Exception:
+            raw_translation_device = "auto"
+    translation_device = normalize_compute_device(raw_translation_device, available_gpu_devices)
+    translation_device_index = device_index(translation_device)
+    translation_n_gpu_layers = int(cfg_get("translation_n_gpu_layers", -1))
+    if translation_device == "cpu":
+        translation_n_gpu_layers = 0
+    elif translation_n_gpu_layers == 0:
+        translation_n_gpu_layers = -1
+
     return AppConfig(
         paddle_lang=raw.get("paddle_lang", "en"),
         ocr_version=raw.get("ocr_version", "PP-OCRv6"),
         worker_mode=raw.get("worker_mode", "selected"),
-        selected_device=raw.get("selected_device", "gpu:0"),
-        available_devices=raw.get("available_devices", ["gpu:0", "gpu:1"]),
+        selected_device=selected_device,
+        available_devices=available_gpu_devices,
         capture_region=raw.get("capture_region", {"left": 0, "top": 0, "width": 2560, "height": 1440}),
         capture_mode=raw.get("capture_mode", "region"),
         capture_crop_enabled=bool(raw.get("capture_crop_enabled", False)),
@@ -696,9 +845,10 @@ def load_config() -> AppConfig:
         translation_model_file=str(cfg_get("translation_model_file", "Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf")),
         translation_source_language=str(cfg_get("translation_source_language", "ja")),
         translation_target_language=translation_target_language,
-        translation_device_index=int(cfg_get("translation_device_index", 0)),
+        translation_device=translation_device,
+        translation_device_index=translation_device_index,
         translation_n_ctx=int(cfg_get("translation_n_ctx", 2048)),
-        translation_n_gpu_layers=int(cfg_get("translation_n_gpu_layers", -1)),
+        translation_n_gpu_layers=translation_n_gpu_layers,
         translation_temperature=float(cfg_get("translation_temperature", 0.1)),
         translation_top_p=float(cfg_get("translation_top_p", 0.95)),
         translation_top_k=int(cfg_get("translation_top_k", 64)),
@@ -2267,6 +2417,8 @@ class LlamaCppGGUFTranslator:
         self.load_lock = threading.Lock()
         self.generate_lock = threading.Lock()
         self.llama = None
+        self.runtime_device = "unknown"
+        self.runtime_n_gpu_layers = 0
 
     def language_name(self, code: str) -> str:
         normalized = str(code or "").strip()
@@ -2314,6 +2466,30 @@ class LlamaCppGGUFTranslator:
 
         return path
 
+    def desired_device(self) -> str:
+        return resolve_translation_device(self.config)
+
+    def llama_kwargs_for_device(self, device: str) -> dict:
+        n_gpu_layers = int(self.config.get("translation_n_gpu_layers", -1))
+        if device == "cpu":
+            n_gpu_layers = 0
+        elif n_gpu_layers == 0:
+            n_gpu_layers = -1
+        return dict(
+            n_ctx=int(self.config.get("translation_n_ctx", 2048)),
+            n_gpu_layers=n_gpu_layers,
+            main_gpu=device_index(device),
+            verbose=False,
+        )
+
+    def load_llama(self, Llama, model_path: str, device: str):
+        kwargs = self.llama_kwargs_for_device(device)
+        log_message(f"[translate] loading GGUF on {device} n_gpu_layers={kwargs['n_gpu_layers']}: {model_path}")
+        llama = Llama(model_path=model_path, **kwargs)
+        self.runtime_device = device
+        self.runtime_n_gpu_layers = int(kwargs["n_gpu_layers"])
+        return llama
+
     def load(self):
         if self.loaded:
             return
@@ -2326,17 +2502,12 @@ class LlamaCppGGUFTranslator:
 
             from llama_cpp import Llama
 
-            common_kwargs = dict(
-                n_ctx=int(self.config.get("translation_n_ctx", 2048)),
-                n_gpu_layers=int(self.config.get("translation_n_gpu_layers", -1)),
-                main_gpu=int(self.config.get("translation_device_index", 0)),
-                verbose=False,
-            )
+            desired_device = self.desired_device()
 
             model_path = self.model_path()
             if model_path:
                 print(f"[translate] loading GGUF: {model_path}", flush=True)
-                self.llama = Llama(model_path=model_path, **common_kwargs)
+                resolved_model_path = model_path
             else:
                 repo_id = str(self.config.get("translation_model_id", "") or "").strip()
                 filename = str(self.config.get("translation_model_file", "") or "").strip()
@@ -2347,17 +2518,27 @@ class LlamaCppGGUFTranslator:
                 if cached_path:
                     print(f"[translate] loading cached GGUF: {cached_path}", flush=True)
                     log_message(f"[translate] loading cached GGUF: {cached_path}")
-                    self.llama = Llama(model_path=str(cached_path), **common_kwargs)
+                    resolved_model_path = str(cached_path)
                 else:
                     print(f"[translate] downloading/loading GGUF: {repo_id} / {filename}", flush=True)
-                    log_message(f"[translate] downloading/loading GGUF: {repo_id} / {filename}")
+                    log_message(f"[translate] downloading/loading GGUF on {desired_device}: {repo_id} / {filename}")
                     from huggingface_hub import hf_hub_download
 
                     downloaded_path = hf_hub_download(repo_id=repo_id, filename=filename)
-                    self.llama = Llama(model_path=downloaded_path, **common_kwargs)
+                    resolved_model_path = str(downloaded_path)
+
+            try:
+                self.llama = self.load_llama(Llama, resolved_model_path, desired_device)
+            except Exception:
+                if desired_device == "cpu":
+                    raise
+                log_message(f"[translate] GPU load failed on {desired_device}; trying CPU fallback:\n{traceback.format_exc()}")
+                print(f"[translate] GPU load failed on {desired_device}; trying CPU fallback", flush=True)
+                self.llama = self.load_llama(Llama, resolved_model_path, "cpu")
+                self.runtime_device = f"cpu(fallback:{desired_device})"
 
             self.loaded = True
-            print("[translate] GGUF ready", flush=True)
+            print(f"[translate] GGUF ready on {self.runtime_device}", flush=True)
 
     def build_prompt(self, text: str, context: str = "") -> str:
         source = self.language_name(str(self.config.get("translation_source_language", "auto")))
@@ -3030,7 +3211,9 @@ def publish_model_status(out_q: mp.Queue, device: str, model: str, status: str, 
 def preload_translation_model_status(translation_manager: SentenceTranslationManager, out_q: mp.Queue, device: str):
     try:
         translation_manager.translator.load()
-        publish_model_status(out_q, device, "translation", "ready", "GGUF ready")
+        runtime_device = str(getattr(translation_manager.translator, "runtime_device", device) or device)
+        status = "fallback" if "fallback:" in runtime_device else "ready"
+        publish_model_status(out_q, runtime_device, "translation", status, f"GGUF ready on {runtime_device}")
     except Exception as exc:
         log_message(f"translation preload failed on {device}:\n{traceback.format_exc()}")
         publish_model_status(out_q, device, "translation", "error", repr(exc))
@@ -3129,10 +3312,15 @@ def ocr_worker_process(device: str, config_dict: dict, in_q: mp.Queue, out_q: mp
         backend = str(config_dict.get("translation_backend", "llama_cpp_gguf") or "").strip().lower()
         if backend == "llama_cpp_gguf":
             translation_manager = SentenceTranslationManager(config_dict)
-            publish_model_status(out_q, requested_device, "translation", "loading", "GGUF loading")
+            translation_device = resolve_translation_device(config_dict)
+            repo_id = str(config_dict.get("translation_model_id", "") or "").strip()
+            filename = str(config_dict.get("translation_model_file", "") or "").strip()
+            cached = bool(translation_manager.translator.model_path()) or bool(find_cached_hf_file(repo_id, filename))
+            loading_message = f"GGUF loading on {translation_device}" if cached else f"GGUF downloading/loading on {translation_device}"
+            publish_model_status(out_q, translation_device, "translation", "loading", loading_message)
             threading.Thread(
                 target=preload_translation_model_status,
-                args=(translation_manager, out_q, requested_device),
+                args=(translation_manager, out_q, translation_device),
                 daemon=True,
             ).start()
         else:
@@ -3312,6 +3500,19 @@ class BBoxOverlay(QWidget):
             return QColor(255, 75, 75, 235)
         return QColor(145, 150, 160, 220)
 
+    def _model_status_display_text(self, label: str, data: dict) -> str:
+        message = str(data.get("message", "") or "")
+        device = str(data.get("device", "") or "").strip()
+        if "fallback:" in message.lower() or "cpu fallback" in message.lower():
+            return f"{label} cpu fallback"
+        if " on " in message:
+            detail = message.rsplit(" on ", 1)[-1].strip()
+            if detail:
+                return f"{label} {detail}"
+        if device:
+            return f"{label} {device}"
+        return label
+
     def _draw_model_status_overlay(self, painter: QPainter):
         if not self.model_status_overlay_enabled():
             return
@@ -3320,6 +3521,7 @@ class BBoxOverlay(QWidget):
             ("OCR", self.model_statuses.get("ocr", {})),
             ("TR", self.model_statuses.get("translation", {})),
         ]
+        display_rows = [(self._model_status_display_text(label, data), data) for label, data in rows]
 
         painter.save()
         font = QFont("Segoe UI")
@@ -3333,7 +3535,7 @@ class BBoxOverlay(QWidget):
         pad_x = 8
         pad_y = 6
         label_gap = 6
-        label_w = max(metrics.horizontalAdvance(label) for label, _ in rows)
+        label_w = max(metrics.horizontalAdvance(label) for label, _ in display_rows)
         rect_w = pad_x * 2 + dot_size + label_gap + label_w
         rect_h = pad_y * 2 + row_h * len(rows)
         rect = QRectF(8, 8, float(rect_w), float(rect_h))
@@ -3344,7 +3546,7 @@ class BBoxOverlay(QWidget):
 
         x = rect.left() + pad_x
         y = rect.top() + pad_y
-        for label, data in rows:
+        for label, data in display_rows:
             status = str(data.get("status", "unknown") or "unknown")
             dot_y = y + (row_h - dot_size) / 2.0
             painter.setBrush(self._model_status_color(status))
@@ -3819,9 +4021,10 @@ class CaptureController:
 
     def _active_devices_from_config(self) -> list[str]:
         if self.config.worker_mode == "selected":
-            active_devices = [self.config.selected_device]
+            active_devices = [normalize_compute_device(self.config.selected_device, self.config.available_devices)]
         else:
-            active_devices = list(self.config.available_devices)
+            active_devices = [normalize_compute_device(device, self.config.available_devices) for device in self.config.available_devices]
+        active_devices = [device for idx, device in enumerate(active_devices) if device and device not in active_devices[:idx]]
         return active_devices or ["cpu"]
 
     def start_workers(self):
@@ -3854,8 +4057,13 @@ class CaptureController:
         for device in self.active_devices:
             self.model_status_by_device[str(device)] = {
                 "ocr": {"status": "loading", "message": "PaddleOCR loading", "device": str(device)},
-                "translation": {"status": translation_status, "message": translation_message, "device": str(device)},
             }
+        translation_device = resolve_translation_device(asdict(self.config))
+        self.model_status_by_device.setdefault(str(translation_device), {})["translation"] = {
+            "status": translation_status,
+            "message": translation_message,
+            "device": str(translation_device),
+        }
         self.update_overlay_model_status("ocr")
         self.update_overlay_model_status("translation")
 
@@ -3888,7 +4096,12 @@ class CaptureController:
             for state in states
             if str(state.get("message", "") or "").strip()
         ]
-        return {"status": status, "message": " | ".join(messages), "device": ",".join(self.active_devices)}
+        devices = [
+            str(state.get("device", "") or "").strip()
+            for state in states
+            if str(state.get("device", "") or "").strip()
+        ]
+        return {"status": status, "message": " | ".join(messages), "device": ",".join(devices)}
 
     def update_overlay_model_status(self, model: str):
         state = self.aggregate_model_status(model)
@@ -4226,6 +4439,14 @@ APP_HELP_TEXT = {
         "1. 대상 창 선택을 눌러 OCR할 게임/앱 창을 고릅니다.\n"
         "2. 번역 오버레이는 선택한 창 위에 자동으로 표시됩니다.\n"
         "3. 데모가 필요하면 스크린샷 저장 또는 녹화 시작을 누릅니다.\n\n"
+        "처음 실행\n"
+        "- ZIP으로 받은 경우 preload_models.bat를 먼저 실행하면 OCR/번역 모델을 다운로드하고 로드까지 검증합니다.\n"
+        "- 번역 GGUF 모델은 수 GB라서 첫 다운로드가 오래 걸릴 수 있습니다.\n"
+        "- Python, venv, llama.cpp를 따로 설치할 필요는 없습니다. ZIP 패키지에 포함되어 있습니다.\n\n"
+        "장치 상태\n"
+        "- GPU가 있으면 기본은 gpu:0, 없으면 cpu입니다. 잘못된 gpu:1 값은 자동 보정됩니다.\n"
+        "- 설정에서 OCR device와 Translation device를 따로 지정할 수 있습니다.\n"
+        "- 초록색은 표시된 장치에서 준비 완료, 노란색은 CPU fallback, 회색은 로딩/다운로드, 빨간색은 실패입니다.\n\n"
         "단축키\n"
         "{toggle}: 이 패널 열기/숨기기\n"
         "{screenshot}: 대상 창 + 오버레이 스크린샷 저장\n"
@@ -4237,6 +4458,14 @@ APP_HELP_TEXT = {
         "1. Click Select Target Window and choose the game/app window.\n"
         "2. The translated overlay follows the selected window.\n"
         "3. Use Save Screenshot or Start Recording for demos.\n\n"
+        "First run\n"
+        "- If you use the ZIP package, run preload_models.bat first to download and verify OCR/translation models.\n"
+        "- The GGUF translation model is several GB, so the first download can take a long time.\n"
+        "- Python, venv, and llama.cpp do not need to be installed separately. They are bundled in the ZIP package.\n\n"
+        "Device status\n"
+        "- If a GPU exists, the default is gpu:0; otherwise it is cpu. Invalid values like gpu:1 are corrected automatically.\n"
+        "- OCR device and Translation device can be assigned separately in Settings.\n"
+        "- Green means ready on the shown device, yellow means CPU fallback, gray means loading/downloading, red means failed.\n\n"
         "Hotkeys\n"
         "{toggle}: show/hide this panel\n"
         "{screenshot}: save target window + overlay screenshot\n"
@@ -4515,6 +4744,8 @@ class ControlPanel(QWidget):
         self.help_label.setWordWrap(True)
         self.translation_language_note_label = QLabel()
         self.translation_language_note_label.setWordWrap(True)
+        self.device_note_label = QLabel()
+        self.device_note_label.setWordWrap(True)
         self.source_language_label = QLabel()
         self.target_language_label = QLabel()
         self.ui_language_label = QLabel()
@@ -4543,12 +4774,16 @@ class ControlPanel(QWidget):
         self.horizontal_require_continuation_checkbox.setChecked(bool(self.config.horizontal_sentence_require_continuation))
 
         self.gpu_combo = QComboBox()
+        self.translation_device_combo = QComboBox()
         device_options = ["cpu"] + [str(d) for d in self.config.available_devices if str(d) != "cpu"]
-        if self.config.selected_device not in device_options:
-            device_options.append(self.config.selected_device)
+        for current_device in (self.config.selected_device, self.config.translation_device):
+            if current_device not in device_options:
+                device_options.append(current_device)
         for device in device_options:
-            self.gpu_combo.addItem(device, device)
+            self.gpu_combo.addItem(device_display_name(device), device)
+            self.translation_device_combo.addItem(device_display_name(device), device)
         self.gpu_combo.setCurrentIndex(max(0, self.gpu_combo.findData(self.config.selected_device)))
+        self.translation_device_combo.setCurrentIndex(max(0, self.translation_device_combo.findData(self.config.translation_device)))
 
         self.ocr_det_model_edit = QLineEdit(self.config.ocr_text_detection_model_dir)
         self.ocr_rec_model_edit = QLineEdit(self.config.ocr_text_recognition_model_dir)
@@ -4645,7 +4880,9 @@ class ControlPanel(QWidget):
         form.addRow(self.output_button)
         form.addRow("OCR scale", self.ocr_scale_spin)
         form.addRow("min_ocr_confidence", self.min_conf_spin)
-        form.addRow("GPU / Device", self.gpu_combo)
+        form.addRow(self.device_note_label)
+        form.addRow("OCR device", self.gpu_combo)
+        form.addRow("Translation device", self.translation_device_combo)
         form.addRow("text_det_thresh", self.det_thresh_spin)
         form.addRow("text_det_box_thresh", self.det_box_thresh_spin)
         form.addRow("text_det_unclip_ratio", self.unclip_spin)
@@ -4714,8 +4951,16 @@ class ControlPanel(QWidget):
         self.config.min_ocr_confidence = float(self.min_conf_spin.value())
         self.config.worker_mode = "selected"
         self.config.selected_device = str(self.gpu_combo.currentData() or self.gpu_combo.currentText() or "cpu")
+        self.config.translation_device = str(self.translation_device_combo.currentData() or self.translation_device_combo.currentText() or "cpu")
+        self.config.translation_device_index = device_index(self.config.translation_device)
+        if self.config.translation_device == "cpu":
+            self.config.translation_n_gpu_layers = 0
+        elif self.config.translation_n_gpu_layers == 0:
+            self.config.translation_n_gpu_layers = -1
         if self.config.selected_device not in self.config.available_devices and self.config.selected_device != "cpu":
             self.config.available_devices.append(self.config.selected_device)
+        if self.config.translation_device not in self.config.available_devices and self.config.translation_device != "cpu":
+            self.config.available_devices.append(self.config.translation_device)
         self.config.text_det_thresh = float(self.det_thresh_spin.value())
         self.config.text_det_box_thresh = float(self.det_box_thresh_spin.value())
         self.config.text_det_unclip_ratio = float(self.unclip_spin.value())
@@ -4744,6 +4989,9 @@ class ControlPanel(QWidget):
                 "worker_mode": self.config.worker_mode,
                 "selected_device": self.config.selected_device,
                 "available_devices": self.config.available_devices,
+                "translation_device": self.config.translation_device,
+                "translation_device_index": self.config.translation_device_index,
+                "translation_n_gpu_layers": self.config.translation_n_gpu_layers,
                 "text_det_thresh": self.config.text_det_thresh,
                 "text_det_box_thresh": self.config.text_det_box_thresh,
                 "text_det_unclip_ratio": self.config.text_det_unclip_ratio,
@@ -4791,6 +5039,10 @@ class ControlPanel(QWidget):
         self.apply_button.setText(app_text(self.config, "apply_settings"))
         self.language_apply_button.setText(app_text(self.config, "apply_settings"))
         self.translation_language_note_label.setText(app_text(self.config, "translation_language_note"))
+        self.device_note_label.setText(
+            f"Detected GPUs: {', '.join(device_display_name(d) for d in self.config.available_devices) if self.config.available_devices else 'none'} | "
+            f"OCR: {device_display_name(self.config.selected_device)} | TR: {device_display_name(self.config.translation_device)}"
+        )
         self.source_language_label.setText(app_text(self.config, "ocr_source_language"))
         self.target_language_label.setText(app_text(self.config, "translation_target_language"))
         self.ui_language_label.setText(app_text(self.config, "ui_language"))
@@ -4944,46 +5196,51 @@ class TrayRuntime:
 
 def preload_translation_model(config: AppConfig):
     if not config.enable_translation:
-        print("[preload] translation disabled; skipping GGUF download", flush=True)
+        preload_message("[preload] translation disabled; skipping GGUF download")
         return
     if str(config.translation_backend or "").strip().lower() != "llama_cpp_gguf":
-        print(f"[preload] translation backend is {config.translation_backend}; skipping GGUF download", flush=True)
+        preload_message(f"[preload] translation backend is {config.translation_backend}; skipping GGUF download")
         return
 
     config_dict = asdict(config)
     translator = LlamaCppGGUFTranslator(config_dict)
+    translation_device = resolve_translation_device(config_dict)
+    preload_message(f"[preload] preparing GGUF translation model on {translation_device}")
     local_path = translator.model_path()
     if local_path:
         candidate = Path(local_path)
         if candidate.is_file():
-            print(f"[preload] GGUF already available: {candidate}", flush=True)
-            return
-        raise FileNotFoundError(f"translation_model_path does not exist: {local_path}")
+            preload_message(f"[preload] GGUF already available: {candidate}")
+        else:
+            raise FileNotFoundError(f"translation_model_path does not exist: {local_path}")
 
-    repo_id = str(config.translation_model_id or "").strip()
-    filename = str(config.translation_model_file or "").strip()
-    if not repo_id or not filename:
-        raise ValueError("translation_model_id and translation_model_file are required")
+    if not local_path:
+        repo_id = str(config.translation_model_id or "").strip()
+        filename = str(config.translation_model_file or "").strip()
+        if not repo_id or not filename:
+            raise ValueError("translation_model_id and translation_model_file are required")
 
-    cached_path = find_cached_hf_file(repo_id, filename)
-    if cached_path:
-        print(f"[preload] GGUF already cached: {cached_path}", flush=True)
-        return
+        cached_path = find_cached_hf_file(repo_id, filename)
+        if cached_path:
+            preload_message(f"[preload] GGUF already cached: {cached_path}")
+        else:
+            preload_message(f"[preload] downloading GGUF: {repo_id} / {filename}")
+            from huggingface_hub import hf_hub_download
 
-    print(f"[preload] downloading GGUF: {repo_id} / {filename}", flush=True)
-    from huggingface_hub import hf_hub_download
+            downloaded = hf_hub_download(repo_id=repo_id, filename=filename)
+            preload_message(f"[preload] GGUF cached: {downloaded}")
 
-    downloaded = hf_hub_download(repo_id=repo_id, filename=filename)
-    print(f"[preload] GGUF cached: {downloaded}", flush=True)
+    translator.load()
+    preload_message(f"[preload] GGUF ready ({translator.runtime_device})")
 
 
 def preload_paddle_models(config: AppConfig):
     config_dict = asdict(config)
     if not str(config_dict.get("paddle_lang", "") or "").strip():
         config_dict["paddle_lang"] = "en"
-    device = str(config_dict.get("selected_device", "cpu") or "cpu")
+    device = normalize_compute_device(config_dict.get("selected_device", "auto"), config_dict.get("available_devices", []))
     configure_accelerator_dlls()
-    print(f"[preload] preparing PaddleOCR models for lang={config_dict['paddle_lang']} device={device}", flush=True)
+    preload_message(f"[preload] preparing PaddleOCR models for lang={config_dict['paddle_lang']} device={device}")
     try:
         ocr, api_version = create_paddle_ocr(config_dict, device)
         warmup_paddle_ocr(ocr, config_dict)
@@ -4991,19 +5248,23 @@ def preload_paddle_models(config: AppConfig):
         log_message(f"[preload] PaddleOCR init failed on {device}:\n{traceback.format_exc()}")
         if not device.startswith("gpu"):
             raise
-        print(f"[preload] PaddleOCR GPU init failed on {device}; trying CPU fallback", flush=True)
+        preload_message(f"[preload] PaddleOCR GPU init failed on {device}; trying CPU fallback")
         ocr, api_version = create_paddle_ocr(config_dict, "cpu")
         warmup_paddle_ocr(ocr, config_dict)
         device = "cpu"
     del ocr
-    print(f"[preload] PaddleOCR ready ({api_version}, device={device})", flush=True)
+    preload_message(f"[preload] PaddleOCR ready ({api_version}, device={device})")
 
 
 def preload_models() -> int:
+    try:
+        PRELOAD_LOG_PATH.unlink()
+    except Exception:
+        pass
     config = load_config()
-    print(f"[preload] app data: {USER_DATA_DIR}", flush=True)
-    print(f"[preload] model cache: {MODEL_CACHE_DIR}", flush=True)
-    print(f"[preload] config: {CONFIG_PATH}", flush=True)
+    preload_message(f"[preload] app data: {USER_DATA_DIR}")
+    preload_message(f"[preload] model cache: {MODEL_CACHE_DIR}")
+    preload_message(f"[preload] config: {CONFIG_PATH}")
 
     errors = []
     for step in (preload_translation_model, preload_paddle_models):
@@ -5011,15 +5272,15 @@ def preload_models() -> int:
             step(config)
         except Exception as exc:
             errors.append(f"{step.__name__}: {repr(exc)}")
-            print(f"[preload] failed: {step.__name__}: {repr(exc)}", flush=True)
+            preload_message(f"[preload] failed: {step.__name__}: {repr(exc)}")
 
     if errors:
-        print("[preload] completed with errors:", flush=True)
+        preload_message("[preload] completed with errors:")
         for error in errors:
-            print(f"  - {error}", flush=True)
+            preload_message(f"  - {error}")
         return 1
 
-    print("[preload] all configured models are ready", flush=True)
+    preload_message("[preload] All configured models are ready.")
     return 0
 
 

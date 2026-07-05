@@ -1,10 +1,8 @@
 paddle_lang: en
 ocr_version: PP-OCRv6
 worker_mode: selected
-selected_device: gpu:1
-available_devices:
-- gpu:0
-- gpu:1
+selected_device: auto
+available_devices: []
 capture_mode: region
 capture_region:
   left: 1281
@@ -83,6 +81,7 @@ hide_overlay_during_capture: false
 bbox_draw_mode: rect
 bbox_line_width: 0
 hide_when_no_bbox: true
+model_status_overlay_enabled: true
 show_ocr_text_box: true
 text_box_font_size: 18
 text_box_adaptive_font_size: true
@@ -126,6 +125,7 @@ translation_model_file: Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_P.gguf
 translation_model_path: ''
 translation_source_language: en
 translation_target_language: ko
+translation_device: auto
 translation_device_index: 0
 translation_n_ctx: 2048
 translation_n_gpu_layers: -1

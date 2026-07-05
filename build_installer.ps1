@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipAppBuild
+    [switch]$SkipAppBuild,
+    [switch]$SkipSetupExe
 )
 
 $ErrorActionPreference = "Stop"
@@ -179,6 +180,20 @@ if (-not $CopiedReleaseZip) {
     Write-Warning "Release ZIP was locked. Wrote fallback ZIP instead: $FallbackZip"
 }
 $null = Copy-FileWithRetry -Source $InstallPs1 -Destination (Join-Path $ReleaseDir "install_$($AppName.Replace('-', '_')).ps1")
+
+if ($SkipSetupExe) {
+    Write-Host ""
+    Write-Host "Package complete:"
+    Write-Host "  $ReleasePackageDir"
+    if (Test-Path $ReleaseZip) {
+        Write-Host "  $ReleaseZip"
+    } elseif (Test-Path (Join-Path $ReleaseDir "$AppName-package-fixed.zip")) {
+        Write-Host "  $(Join-Path $ReleaseDir "$AppName-package-fixed.zip")"
+    }
+    Write-Host ""
+    Write-Host "Setup EXE was skipped by -SkipSetupExe."
+    return
+}
 
 & $Python -m pip install --upgrade pyinstaller
 

@@ -14,9 +14,54 @@ $Python = Join-Path $VenvDir "Scripts\python.exe"
 $SitePackages = Join-Path $VenvDir "Lib\site-packages"
 $NvidiaCudnnDir = Join-Path $SitePackages "nvidia\cudnn"
 
+function Find-Python311 {
+    $Candidates = @(
+        @{ Command = "py"; Args = @("-3.11") },
+        @{ Command = "python"; Args = @() },
+        @{ Command = "python3"; Args = @() }
+    )
+
+    foreach ($Candidate in $Candidates) {
+        try {
+            $Command = $Candidate.Command
+            $Args = $Candidate.Args
+            $Version = & $Command @Args -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null
+            if ($LASTEXITCODE -eq 0 -and ($Version | Select-Object -First 1) -eq "3.11") {
+                return $Candidate
+            }
+        } catch {
+        }
+    }
+    return $null
+}
+
+function Ensure-Python311 {
+    $Found = Find-Python311
+    if ($Found) {
+        return $Found
+    }
+
+    $Winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $Winget) {
+        throw "Python 3.11 was not found and winget is unavailable. Install Python 3.11 or install winget, then rerun build_app.ps1."
+    }
+
+    Write-Host "Python 3.11 was not found. Installing Python 3.11 with winget..."
+    & winget install --id Python.Python.3.11 --silent --accept-package-agreements --accept-source-agreements
+
+    $Found = Find-Python311
+    if (-not $Found) {
+        throw "Python 3.11 install completed, but Python 3.11 is still not available in PATH. Open a new terminal and rerun build_app.ps1."
+    }
+    return $Found
+}
+
 if (-not (Test-Path $Python)) {
     Write-Host "Creating virtual environment: $VenvDir"
-    python -m venv $VenvDir
+    $BootstrapPython = Ensure-Python311
+    $BootstrapCommand = $BootstrapPython.Command
+    $BootstrapArgs = $BootstrapPython.Args
+    & $BootstrapCommand @BootstrapArgs -m venv $VenvDir
 }
 
 if (-not (Test-Path $Python)) {
@@ -81,9 +126,48 @@ try {
     @"
 @echo off
 cd /d "%~dp0"
-"%~dp0$AppName.exe" --preload-models
+echo Boku No Translator model preload
+echo.
+echo This downloads and verifies the configured OCR and translation models.
+echo First run can take a long time because the GGUF translation model is several GB.
+echo Keep this window open until you see: "All configured models are ready."
+echo.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "`$exe = Join-Path (Get-Location) '$AppName.exe'; `$log = Join-Path `$env:LOCALAPPDATA 'boku-no-translator\logs\preload_models.log'; Remove-Item -LiteralPath `$log -Force -ErrorAction SilentlyContinue; `$p = Start-Process -FilePath `$exe -ArgumentList '--preload-models' -PassThru; `$last = 0; while (-not `$p.HasExited) { if (Test-Path `$log) { `$lines = Get-Content -LiteralPath `$log -ErrorAction SilentlyContinue; if (`$lines.Count -gt `$last) { `$lines[`$last..(`$lines.Count - 1)]; `$last = `$lines.Count } }; Start-Sleep -Seconds 1 }; if (Test-Path `$log) { `$lines = Get-Content -LiteralPath `$log -ErrorAction SilentlyContinue; if (`$lines.Count -gt `$last) { `$lines[`$last..(`$lines.Count - 1)] } }; exit `$p.ExitCode"
 pause
 "@ | Set-Content -LiteralPath $PreloadBat -Encoding ASCII
+
+    $ReadmeFirst = Join-Path $DistDir "README_FIRST.txt"
+    @"
+Boku No Translator
+==================
+
+Quick start from ZIP
+1. Run boku-no-translator.exe.
+2. The app starts in the system tray.
+3. Click the tray icon to open Settings / Usage / Language.
+4. On first use, OCR and translation models may download automatically.
+
+Recommended first run
+- Run preload_models.bat once before using the overlay.
+- It downloads and verifies PaddleOCR and the GGUF translation model.
+- The translation model is several GB, so the first run can take a long time.
+
+Device behavior
+- OCR device and Translation device are separate settings.
+- The app auto-detects NVIDIA GPUs.
+- If one GPU exists, the default is gpu:0.
+- If no GPU exists, the default is cpu.
+- If an invalid device such as gpu:1 is found on a one-GPU machine, it is corrected to gpu:0.
+
+Status overlay
+- Green means ready on the shown device.
+- Yellow means CPU fallback.
+- Gray means loading/downloading.
+- Red means failed. Check logs at:
+  %LOCALAPPDATA%\boku-no-translator\logs\app.log
+
+No Python is required for the ZIP package. Python and llama.cpp are bundled inside _internal.
+"@ | Set-Content -LiteralPath $ReadmeFirst -Encoding UTF8
 
     Write-Host ""
     Write-Host "Build complete:"

@@ -5,7 +5,7 @@
 <h1 align="center">Boku No Translator</h1>
 
 <p align="center">
-  Real-time translator for games powered by AI model.
+  A tray-first OCR translation overlay for games, visual novels, and live app windows.
 </p>
 
 <p align="center">
@@ -19,6 +19,10 @@
   <img alt="Hotkey" src="https://img.shields.io/badge/Hotkey-Ctrl%2BAlt%2BA-f59e0b">
   <img alt="License" src="https://img.shields.io/badge/License-Non--Commercial-red">
 </p>
+
+## Description
+Real-time translator for games powered by local OCR and a local AI translation model.
+
 
 ## Demo
 
@@ -37,6 +41,7 @@ Boku No Translator watches a selected window, detects text with OCR, translates 
 - Source and target language controls separate from app UI language
 - PaddleOCR detection/recognition settings exposed in the UI
 - GGUF translation model support with automatic Hugging Face download
+- Separate OCR and translation device selection with automatic GPU detection
 - Screenshot and MP4 demo capture with the overlay composited in
 - Vertical Japanese reading order and bottom subtitle support for English translation
 
@@ -51,12 +56,13 @@ Boku No Translator builds on local OCR and local GGUF inference:
 
 ## Requirements
 
-For the packaged installer:
+For the packaged ZIP or installer:
 
 - Windows 10 or Windows 11
 - Internet connection for first-time OCR/model downloads
 - Several GB of free disk space for the app, OCR cache, and GGUF model cache
 - NVIDIA GPU is recommended for faster OCR/translation, but CPU mode can be selected in Settings
+- Python, venv, and llama.cpp do not need to be installed separately for the packaged ZIP. They are bundled.
 
 For running or building from source:
 
@@ -66,7 +72,27 @@ For running or building from source:
 
 ## Install
 
-Use the generated installer:
+Use the generated ZIP package:
+
+```text
+release\boku-no-translator-package-fixed.zip
+```
+
+Unzip it and run:
+
+```text
+boku-no-translator.exe
+```
+
+For the best first-run experience, run this once before using the overlay:
+
+```text
+preload_models.bat
+```
+
+It downloads and verifies the configured PaddleOCR and GGUF translation models. The translation model is several GB, so the first run can take a long time.
+
+If you build a setup executable, it is created here:
 
 ```text
 release\boku-no-translator-setup.exe
@@ -110,7 +136,28 @@ PaddleOCR/PaddleX OCR models are also downloaded automatically when OCR initiali
 boku-no-translator.exe --preload-models
 ```
 
-The installed app also creates a Start Menu shortcut named `Boku No Translator - Download Models`.
+The ZIP also includes `preload_models.bat`, which runs the same command and keeps the console open so you can see progress and errors.
+
+## Devices
+
+The app auto-detects NVIDIA GPUs at startup:
+
+- One GPU: defaults to `gpu:0`
+- Multiple GPUs: defaults to `gpu:0`
+- No GPU: defaults to `cpu`
+- Invalid stale values such as `gpu:1` on a one-GPU machine are corrected to `gpu:0`
+
+OCR and translation can be assigned separately in Settings:
+
+- `OCR device`
+- `Translation device`
+
+The overlay status tells you what is actually connected:
+
+- Green: ready on the shown device
+- Yellow: CPU fallback
+- Gray: loading or downloading
+- Red: failed, check `%LOCALAPPDATA%\boku-no-translator\logs\app.log`
 
 ## Support
 
@@ -136,10 +183,12 @@ Build the packaged app:
 .\build_app.ps1
 ```
 
-Create the installer:
+`build_app.ps1` creates `.venv` automatically. If Python 3.11 is missing, it tries to install Python 3.11 with `winget`.
+
+Create the release ZIP and package folder:
 
 ```powershell
-.\build_installer.ps1
+.\build_installer.ps1 -SkipSetupExe
 ```
 
 The app executable is created at:
@@ -148,10 +197,10 @@ The app executable is created at:
 dist\boku-no-translator\boku-no-translator.exe
 ```
 
-The installer is created at:
+The ZIP is created at:
 
 ```text
-release\boku-no-translator-setup.exe
+release\boku-no-translator-package-fixed.zip
 ```
 
 ## License
