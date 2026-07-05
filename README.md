@@ -5,7 +5,7 @@
 <h1 align="center">Boku No Translator</h1>
 
 <p align="center">
-  Real-time translator for games powered by AI model.
+  A tray-first OCR translation overlay for games, visual novels, and live app windows.
 </p>
 
 <p align="center">
@@ -19,6 +19,10 @@
   <img alt="Hotkey" src="https://img.shields.io/badge/Hotkey-Ctrl%2BAlt%2BA-f59e0b">
   <img alt="License" src="https://img.shields.io/badge/License-Non--Commercial-red">
 </p>
+
+## Description
+Real-time translator for games powered by local OCR and a local AI translation model.
+
 
 ## Demo
 
@@ -37,6 +41,7 @@ Boku No Translator watches a selected window, detects text with OCR, translates 
 - Source and target language controls separate from app UI language
 - PaddleOCR detection/recognition settings exposed in the UI
 - GGUF translation model support with automatic Hugging Face download
+- Separate OCR and translation device selection with automatic GPU detection
 - Screenshot and MP4 demo capture with the overlay composited in
 - Vertical Japanese reading order and bottom subtitle support for English translation
 
@@ -51,22 +56,43 @@ Boku No Translator builds on local OCR and local GGUF inference:
 
 ## Requirements
 
-For the packaged installer:
+For the packaged ZIP or installer:
 
 - Windows 10 or Windows 11
 - Internet connection for first-time OCR/model downloads
 - Several GB of free disk space for the app, OCR cache, and GGUF model cache
 - NVIDIA GPU is recommended for faster OCR/translation, but CPU mode can be selected in Settings
+- Python, venv, and llama.cpp do not need to be installed separately for the packaged ZIP. They are bundled.
 
 For running or building from source:
 
 - Python 3.11 recommended
 - Dependencies listed in [requirements.txt](./requirements.txt)
-- Paddle runtime installed in the build environment; the build script keeps an existing GPU Paddle runtime or installs CPU `paddlepaddle` when none is detected
+- Paddle runtime is selected by `build_app.ps1` from the detected NVIDIA GPU compute capability
 
 ## Install
 
-Use the generated installer:
+Use the generated ZIP package:
+
+```text
+release\boku-no-translator-package-fixed.zip
+```
+
+Unzip it and run:
+
+```text
+boku-no-translator.exe
+```
+
+For the best first-run experience, run this once before using the overlay:
+
+```text
+preload_models.bat
+```
+
+It downloads and verifies the configured PaddleOCR and GGUF translation models. The translation model is several GB, so the first run can take a long time.
+
+If you build a setup executable, it is created here:
 
 ```text
 release\boku-no-translator-setup.exe
@@ -110,7 +136,28 @@ PaddleOCR/PaddleX OCR models are also downloaded automatically when OCR initiali
 boku-no-translator.exe --preload-models
 ```
 
-The installed app also creates a Start Menu shortcut named `Boku No Translator - Download Models`.
+The ZIP also includes `preload_models.bat`, which runs the same command and keeps the console open so you can see progress and errors.
+
+## Devices
+
+The app auto-detects NVIDIA GPUs at startup:
+
+- One GPU: defaults to `gpu:0`
+- Multiple GPUs: defaults to `gpu:0`
+- No GPU: defaults to `cpu`
+- Invalid stale values such as `gpu:1` on a one-GPU machine are corrected to `gpu:0`
+
+OCR and translation can be assigned separately in Settings:
+
+- `OCR device`
+- `Translation device`
+
+The overlay status tells you what is actually connected:
+
+- Green: ready on the shown device
+- Yellow: CPU fallback
+- Gray: loading or downloading
+- Red: failed, check `%LOCALAPPDATA%\boku-no-translator\logs\app.log`
 
 ## Support
 
@@ -136,17 +183,61 @@ Build the packaged app:
 .\build_app.ps1
 ```
 
-If this makes an error with ErrorID which includes UnauthorizedAccess, try:
+`build_app.ps1` creates `.venv` automatically. If Python 3.11 is missing, it tries to install Python 3.11 with `winget`. If `winget` is unavailable or does not expose Python after install, the script downloads the official Python 3.11 Windows installer from python.org and installs it silently for the current user.
+
+By default, the build script also prepares the Python-side CUDA runtime used by the bundled app:
+
+- installs NVIDIA CUDA/cuDNN Python wheels such as `nvidia-cudnn-cu12`
+- installs CUDA-enabled `llama-cpp-python`; RTX 20/30/40 class GPUs use the configured CUDA wheel index, while RTX 50 / Blackwell builds from source automatically
+- detects NVIDIA GPUs with `nvidia-smi` and selects the Paddle runtime automatically
+- uses Paddle CUDA 12.9 for RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090
+- uses Paddle CUDA 12.6 for modern RTX/GTX GPUs such as RTX 20, 30, and 40 series
+- uses Paddle CUDA 11.8 for older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards
+- falls back to CPU Paddle when no NVIDIA GPU is detected
+
+NVIDIA display drivers are not installed by the script. Install or update the NVIDIA driver separately if `nvidia-smi` is not available. RTX 50 / Blackwell translation GPU support also needs a CUDA source build of `llama-cpp-python`; the script tries to prepare Visual Studio Build Tools and CUDA Toolkit with `winget` when they are missing.
+
+Useful build options:
+
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Scope Process
+.\build_app.ps1 -CpuOnly
+.\build_app.ps1 -PaddleGpuRuntime auto
+.\build_app.ps1 -PaddleGpuRuntime cuda118
+.\build_app.ps1 -PaddleGpuRuntime cuda126
+.\build_app.ps1 -PaddleGpuRuntime cuda129
+.\build_app.ps1 -PaddleGpuRuntime cpu
+.\build_app.ps1 -LlamaCudaInstallMode auto
+.\build_app.ps1 -LlamaCudaInstallMode source
+.\build_app.ps1 -LlamaCudaInstallMode wheel
+.\build_app.ps1 -RequireLlamaCuda
+.\build_app.ps1 -ForceBlackwellPaddle
+.\build_app.ps1 -Python311InstallerUrl "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+.\build_app.ps1 -LlamaCudaWheelIndex "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+.\build_app.ps1 -SkipDependencyInstall
 ```
 
-If this makes an error with ErrorID which includes Python, try to install python 3.11
-
-Create the installer:
+For RTX 5070 / 5080 / 5090 systems, the script should detect compute capability `12.0` automatically and select `cuda129`. If the target machine is RTX 50 series but the build machine is not, use:
 
 ```powershell
-.\build_installer.ps1
+.\build_app.ps1 -PaddleGpuRuntime cuda129
+```
+
+For RTX 50 / Blackwell systems, `-LlamaCudaInstallMode auto` selects source build because the standard `llama-cpp-python` CUDA wheel index does not currently provide a CUDA 12.8/12.9 Windows wheel. If the build cannot install Visual Studio Build Tools or CUDA Toolkit automatically, install those once and rerun the same command. By default, CUDA llama verification failure is a warning; add `-RequireLlamaCuda` when you want the build to fail unless GPU offload is verified.
+
+The packaged ZIP contains one Paddle runtime selected at build time. If you build on one GPU family and move the ZIP to a very different GPU family, rebuild on the target PC or pass the matching `-PaddleGpuRuntime` option.
+
+Create the release ZIP and package folder:
+
+```powershell
+.\build_installer.ps1 -SkipSetupExe
+```
+
+The installer build forwards the same Paddle runtime selector:
+
+```powershell
+.\build_installer.ps1 -PaddleGpuRuntime cuda129
+.\build_installer.ps1 -PaddleGpuRuntime cuda129 -LlamaCudaInstallMode source
+.\build_installer.ps1 -PaddleGpuRuntime cuda118 -LlamaCudaInstallMode wheel -SkipSetupExe
 ```
 
 The app executable is created at:
@@ -155,10 +246,10 @@ The app executable is created at:
 dist\boku-no-translator\boku-no-translator.exe
 ```
 
-The installer is created at:
+The ZIP is created at:
 
 ```text
-release\boku-no-translator-setup.exe
+release\boku-no-translator-package-fixed.zip
 ```
 
 ## License
