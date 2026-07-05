@@ -116,8 +116,17 @@ By default, the build script also prepares the Python-side CUDA runtime used by 
 - installs CUDA-enabled `llama-cpp-python`; RTX 20/30/40 class GPUs use the configured CUDA wheel index, while RTX 50 / Blackwell builds from source automatically
 - detects NVIDIA GPUs with `nvidia-smi` and selects the Paddle runtime automatically
 - uses Paddle CUDA 12.9 for RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090
+```powershell
+.\build_app.ps1 -PaddleGpuRuntime cuda129 -LlamaCudaInstallMode source -RequireLlamaCuda
+```
 - uses Paddle CUDA 12.6 for modern RTX/GTX GPUs such as RTX 20, 30, and 40 series
+```powershell
+.\build_app.ps1 -PaddleGpuRuntime cuda126 -LlamaCudaInstallMode auto -RequireLlamaCuda
+```
 - uses Paddle CUDA 11.8 for older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards
+```powershell
+.\build_app.ps1 -PaddleGpuRuntime cuda118 -LlamaCudaInstallMode auto -RequireLlamaCuda
+```
 - falls back to CPU Paddle when no NVIDIA GPU is detected
 
 NVIDIA display drivers are not installed by the script. Install or update the NVIDIA driver separately if `nvidia-smi` is not available. RTX 50 / Blackwell translation GPU support also needs a CUDA source build of `llama-cpp-python`; the script tries to prepare Visual Studio Build Tools and CUDA Toolkit with `winget` when they are missing.
@@ -141,11 +150,6 @@ Useful build options:
 .\build_app.ps1 -SkipDependencyInstall
 ```
 
-For RTX 5070 / 5080 / 5090 systems, copy and paste this in powershell:
-
-```powershell
-.\build_app.ps1 -PaddleGpuRuntime cuda129 -LlamaCudaInstallMode source -RequireLlamaCuda
-```
 
 The app executable is created at:
 
