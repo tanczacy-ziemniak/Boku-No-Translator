@@ -188,14 +188,14 @@ Build the packaged app:
 By default, the build script also prepares the Python-side CUDA runtime used by the bundled app:
 
 - installs NVIDIA CUDA/cuDNN Python wheels such as `nvidia-cudnn-cu12`
-- installs a CUDA-enabled `llama-cpp-python` wheel from the configured wheel index
+- installs CUDA-enabled `llama-cpp-python`; RTX 20/30/40 class GPUs use the configured CUDA wheel index, while RTX 50 / Blackwell builds from source automatically
 - detects NVIDIA GPUs with `nvidia-smi` and selects the Paddle runtime automatically
 - uses Paddle CUDA 12.9 for RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090
 - uses Paddle CUDA 12.6 for modern RTX/GTX GPUs such as RTX 20, 30, and 40 series
 - uses Paddle CUDA 11.8 for older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards
 - falls back to CPU Paddle when no NVIDIA GPU is detected
 
-NVIDIA display drivers are not installed by the script. Install or update the NVIDIA driver separately if `nvidia-smi` is not available.
+NVIDIA display drivers are not installed by the script. Install or update the NVIDIA driver separately if `nvidia-smi` is not available. RTX 50 / Blackwell translation GPU support also needs a CUDA source build of `llama-cpp-python`; the script tries to prepare Visual Studio Build Tools and CUDA Toolkit with `winget` when they are missing.
 
 Useful build options:
 
@@ -206,6 +206,9 @@ Useful build options:
 .\build_app.ps1 -PaddleGpuRuntime cuda126
 .\build_app.ps1 -PaddleGpuRuntime cuda129
 .\build_app.ps1 -PaddleGpuRuntime cpu
+.\build_app.ps1 -LlamaCudaInstallMode auto
+.\build_app.ps1 -LlamaCudaInstallMode source
+.\build_app.ps1 -LlamaCudaInstallMode wheel
 .\build_app.ps1 -ForceBlackwellPaddle
 .\build_app.ps1 -Python311InstallerUrl "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
 .\build_app.ps1 -LlamaCudaWheelIndex "https://abetlen.github.io/llama-cpp-python/whl/cu124"
@@ -217,6 +220,8 @@ For RTX 5070 / 5080 / 5090 systems, the script should detect compute capability 
 ```powershell
 .\build_app.ps1 -PaddleGpuRuntime cuda129
 ```
+
+For RTX 50 / Blackwell systems, `-LlamaCudaInstallMode auto` selects source build because the standard `llama-cpp-python` CUDA wheel index does not currently provide a CUDA 12.8/12.9 Windows wheel. If the build cannot install Visual Studio Build Tools or CUDA Toolkit automatically, install those once and rerun the same command.
 
 The packaged ZIP contains one Paddle runtime selected at build time. If you build on one GPU family and move the ZIP to a very different GPU family, rebuild on the target PC or pass the matching `-PaddleGpuRuntime` option.
 
@@ -230,7 +235,8 @@ The installer build forwards the same Paddle runtime selector:
 
 ```powershell
 .\build_installer.ps1 -PaddleGpuRuntime cuda129
-.\build_installer.ps1 -PaddleGpuRuntime cuda118 -SkipSetupExe
+.\build_installer.ps1 -PaddleGpuRuntime cuda129 -LlamaCudaInstallMode source
+.\build_installer.ps1 -PaddleGpuRuntime cuda118 -LlamaCudaInstallMode wheel -SkipSetupExe
 ```
 
 The app executable is created at:

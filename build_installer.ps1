@@ -3,7 +3,9 @@ param(
     [switch]$SkipSetupExe,
     [switch]$CpuOnly,
     [ValidateSet("auto", "cpu", "standard", "blackwell", "cuda118", "cuda126", "cuda129")]
-    [string]$PaddleGpuRuntime = "auto"
+    [string]$PaddleGpuRuntime = "auto",
+    [ValidateSet("auto", "wheel", "source", "skip")]
+    [string]$LlamaCudaInstallMode = "auto"
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,7 +23,7 @@ $PayloadZip = Join-Path $PayloadDir "$AppName-package.zip"
 $SetupExe = Join-Path $ReleaseDir "$AppName-setup.exe"
 
 if (-not $SkipAppBuild) {
-    $BuildArgs = @("-PaddleGpuRuntime", $PaddleGpuRuntime)
+    $BuildArgs = @("-PaddleGpuRuntime", $PaddleGpuRuntime, "-LlamaCudaInstallMode", $LlamaCudaInstallMode)
     if ($CpuOnly) {
         $BuildArgs += "-CpuOnly"
     }

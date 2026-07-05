@@ -7,13 +7,18 @@ param(
     [string]$PaddleGpuRuntime = "auto",
     [string]$PaddleVersion = "3.3.1",
     [string]$Python311InstallerUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
+    [ValidateSet("auto", "wheel", "source", "skip")]
+    [string]$LlamaCudaInstallMode = "auto",
+    [string]$LlamaCppPythonVersion = "0.3.32",
     [string]$LlamaCudaWheelIndex = "",
     [string]$DefaultLlamaCudaWheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu124",
-    [string]$BlackwellLlamaCudaWheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu128",
+    [string]$BlackwellLlamaCudaWheelIndex = "",
     [string]$PaddleCpuIndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cpu/",
     [string]$PaddleCuda118IndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cu118/",
     [string]$PaddleCuda126IndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cu126/",
-    [string]$PaddleCuda129IndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cu129/"
+    [string]$PaddleCuda129IndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cu129/",
+    [string]$CudaToolkitWingetId = "Nvidia.CUDA",
+    [string]$VsBuildToolsWingetId = "Microsoft.VisualStudio.2022.BuildTools"
 )
 
 $ErrorActionPreference = "Stop"
@@ -365,7 +370,7 @@ function Get-EffectiveLlamaCudaWheelIndex {
     if ($LlamaCudaWheelIndex) {
         return $LlamaCudaWheelIndex
     }
-    if ((Get-PaddleGpuRuntimePlan).Mode -eq "cuda129") {
+    if ((Get-PaddleGpuRuntimePlan).Mode -eq "cuda129" -and $BlackwellLlamaCudaWheelIndex) {
         return $BlackwellLlamaCudaWheelIndex
     }
     return $DefaultLlamaCudaWheelIndex
@@ -375,6 +380,178 @@ function Test-PythonPackage {
     param([Parameter(Mandatory=$true)][string]$PackageName)
     & $Python -c "import importlib.metadata as md; raise SystemExit(0 if '$PackageName' in [d.metadata.get('Name','').lower() for d in md.distributions()] else 1)" 1>$null 2>$null
     return ($LASTEXITCODE -eq 0)
+}
+
+function Get-MaxNvidiaComputeCapability {
+    $Infos = Get-NvidiaGpuInfos
+    $Max = $null
+    foreach ($Info in $Infos) {
+        if ($null -eq $Info.ComputeCapability) {
+            continue
+        }
+        if ($null -eq $Max -or $Info.ComputeCapability -gt $Max) {
+            $Max = $Info.ComputeCapability
+        }
+    }
+    return $Max
+}
+
+function Get-CudaArchitectureForLlamaBuild {
+    $Compute = Get-MaxNvidiaComputeCapability
+    if ($null -eq $Compute) {
+        return "native"
+    }
+    return ([int][Math]::Round($Compute * 10)).ToString()
+}
+
+function Find-Nvcc {
+    $Command = Get-Command nvcc.exe -ErrorAction SilentlyContinue
+    if ($Command) {
+        return $Command.Source
+    }
+
+    $Candidates = @()
+    if ($env:CUDA_PATH) {
+        $Candidates += (Join-Path $env:CUDA_PATH "bin\nvcc.exe")
+    }
+    $ToolkitRoot = Join-Path $env:ProgramFiles "NVIDIA GPU Computing Toolkit\CUDA"
+    if (Test-Path $ToolkitRoot) {
+        $Candidates += Get-ChildItem -LiteralPath $ToolkitRoot -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName "bin\nvcc.exe" }
+    }
+
+    foreach ($Candidate in $Candidates) {
+        if ($Candidate -and (Test-Path $Candidate)) {
+            return $Candidate
+        }
+    }
+    return $null
+}
+
+function Find-VisualStudioWithVCTools {
+    $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $VsWhere)) {
+        return $null
+    }
+    try {
+        $InstallPath = & $VsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+        if ($LASTEXITCODE -eq 0 -and $InstallPath) {
+            return ($InstallPath | Select-Object -First 1).Trim()
+        }
+    } catch {
+    }
+    return $null
+}
+
+function Invoke-WingetInstall {
+    param(
+        [Parameter(Mandatory=$true)][string]$PackageId,
+        [string[]]$ExtraArgs = @()
+    )
+    $Winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $Winget) {
+        return $false
+    }
+    Write-Host "Installing $PackageId with winget..."
+    & winget install --id $PackageId --exact --silent --accept-package-agreements --accept-source-agreements @ExtraArgs
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Ensure-LlamaSourceBuildPrerequisites {
+    Write-Host "Preparing llama-cpp-python CUDA source build prerequisites..."
+    & $Python -m pip install --upgrade cmake ninja scikit-build-core setuptools wheel
+
+    if (-not (Find-VisualStudioWithVCTools)) {
+        $Installed = Invoke-WingetInstall `
+            -PackageId $VsBuildToolsWingetId `
+            -ExtraArgs @("--override", "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended")
+        if (-not $Installed -or -not (Find-VisualStudioWithVCTools)) {
+            throw "Visual Studio 2022 Build Tools with C++ workload was not found. Install it, then rerun build_app.ps1."
+        }
+    }
+
+    $Nvcc = Find-Nvcc
+    if (-not $Nvcc) {
+        $Installed = Invoke-WingetInstall -PackageId $CudaToolkitWingetId
+        $Nvcc = Find-Nvcc
+        if (-not $Installed -or -not $Nvcc) {
+            throw "CUDA Toolkit nvcc.exe was not found. Install NVIDIA CUDA Toolkit 12.8 or newer, then rerun build_app.ps1."
+        }
+    }
+
+    $CudaHome = Split-Path -Parent (Split-Path -Parent $Nvcc)
+    $env:CUDA_PATH = $CudaHome
+    $env:CUDA_HOME = $CudaHome
+    $env:PATH = (Join-Path $CudaHome "bin") + ";" + $env:PATH
+    Write-Host "  CUDA Toolkit: $CudaHome"
+}
+
+function Install-LlamaCudaWheel {
+    $EffectiveLlamaCudaWheelIndex = Get-EffectiveLlamaCudaWheelIndex
+    if (-not $EffectiveLlamaCudaWheelIndex) {
+        throw "No llama-cpp-python CUDA wheel index is configured."
+    }
+    Write-Host "Installing CUDA-enabled llama-cpp-python wheel..."
+    Write-Host "  index: $EffectiveLlamaCudaWheelIndex"
+    & $Python -m pip install --upgrade --force-reinstall --prefer-binary --no-deps --index-url $EffectiveLlamaCudaWheelIndex "llama-cpp-python==$LlamaCppPythonVersion"
+}
+
+function Install-LlamaCudaFromSource {
+    Ensure-LlamaSourceBuildPrerequisites
+    $Arch = Get-CudaArchitectureForLlamaBuild
+    Write-Host "Building llama-cpp-python with CUDA from source..."
+    Write-Host "  version: $LlamaCppPythonVersion"
+    Write-Host "  CMAKE_CUDA_ARCHITECTURES=$Arch"
+
+    $OldCmakeArgs = $env:CMAKE_ARGS
+    $OldForceCmake = $env:FORCE_CMAKE
+    $OldGenerator = $env:CMAKE_GENERATOR
+    try {
+        $env:CMAKE_ARGS = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=$Arch"
+        $env:FORCE_CMAKE = "1"
+        $env:CMAKE_GENERATOR = "Ninja"
+        & $Python -m pip uninstall -y llama-cpp-python
+        & $Python -m pip install --upgrade --force-reinstall --no-cache-dir --no-deps --no-binary=llama-cpp-python "llama-cpp-python==$LlamaCppPythonVersion"
+    } finally {
+        $env:CMAKE_ARGS = $OldCmakeArgs
+        $env:FORCE_CMAKE = $OldForceCmake
+        $env:CMAKE_GENERATOR = $OldGenerator
+    }
+}
+
+function Install-LlamaCppPythonCuda {
+    if ($LlamaCudaInstallMode -eq "skip") {
+        Write-Warning "Skipping CUDA llama-cpp-python installation by request."
+        return
+    }
+
+    $RuntimePlan = Get-PaddleGpuRuntimePlan
+    if ($RuntimePlan.Mode -eq "cpu") {
+        Write-Host "CPU runtime selected. Skipping CUDA llama-cpp-python installation."
+        return
+    }
+
+    $Mode = $LlamaCudaInstallMode
+    if ($Mode -eq "auto") {
+        $Mode = if ($RuntimePlan.Mode -eq "cuda129") { "source" } else { "wheel" }
+    }
+
+    if ($Mode -eq "source") {
+        Install-LlamaCudaFromSource
+    } else {
+        Install-LlamaCudaWheel
+    }
+
+    $LlamaCudaDll = Join-Path $LlamaLibDir "ggml-cuda.dll"
+    if (-not (Test-Path $LlamaCudaDll)) {
+        throw "CUDA llama.cpp DLL was not found after installation: $LlamaCudaDll"
+    }
+    Write-Host "CUDA llama.cpp DLL ready: $LlamaCudaDll"
+}
+
+function Ensure-CompatiblePythonPackages {
+    & $Python -m pip install --upgrade "numpy>=1.24,<2.4" "opencv-python==4.10.0.84" "opencv-python-headless==4.10.0.84"
 }
 
 function Install-CudaPythonPackages {
@@ -416,15 +593,8 @@ function Install-CudaPythonPackages {
             nvidia-nvjitlink-cu12
     }
 
-    Write-Host "Installing CUDA-enabled llama-cpp-python wheel..."
-    $EffectiveLlamaCudaWheelIndex = Get-EffectiveLlamaCudaWheelIndex
-    Write-Host "  llama-cpp-python wheel index: $EffectiveLlamaCudaWheelIndex"
-    $LlamaCudaDll = Join-Path $LlamaLibDir "ggml-cuda.dll"
-    if ((Test-Path $LlamaCudaDll) -and $RuntimePlan.Mode -ne "cuda129") {
-        & $Python -m pip install --upgrade --prefer-binary --extra-index-url $EffectiveLlamaCudaWheelIndex llama-cpp-python
-    } else {
-        & $Python -m pip install --upgrade --force-reinstall --prefer-binary --extra-index-url $EffectiveLlamaCudaWheelIndex llama-cpp-python
-    }
+    Install-LlamaCppPythonCuda
+    Ensure-CompatiblePythonPackages
 }
 
 function Ensure-PaddleRuntime {
@@ -466,8 +636,11 @@ function Assert-GpuBuildInputs {
     }
     $LlamaCudaDll = Join-Path $LlamaLibDir "ggml-cuda.dll"
     if (-not (Test-Path $LlamaCudaDll)) {
-        Write-Warning "CUDA llama.cpp DLL was not found: $LlamaCudaDll"
-        Write-Warning "Translation may fall back to CPU unless the CUDA llama-cpp-python wheel is available for this Python/CUDA combination."
+        if ($LlamaCudaInstallMode -eq "skip") {
+            Write-Warning "CUDA llama.cpp DLL was not found because CUDA llama install was skipped: $LlamaCudaDll"
+        } else {
+            throw "CUDA llama.cpp DLL was not found: $LlamaCudaDll"
+        }
     }
 }
 
@@ -493,6 +666,7 @@ try {
     }
 
     Ensure-PaddleRuntime
+    Ensure-CompatiblePythonPackages
 
     & $Python -m pip install --upgrade pyinstaller
     Assert-GpuBuildInputs
@@ -552,7 +726,7 @@ echo This downloads and verifies the configured OCR and translation models.
 echo First run can take a long time because the GGUF translation model is several GB.
 echo Keep this window open until you see: "All configured models are ready."
 echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "`$exe = Join-Path (Get-Location) '$AppName.exe'; `$log = Join-Path `$env:LOCALAPPDATA 'boku-no-translator\logs\preload_models.log'; Remove-Item -LiteralPath `$log -Force -ErrorAction SilentlyContinue; `$p = Start-Process -FilePath `$exe -ArgumentList '--preload-models' -PassThru; `$last = 0; while (-not `$p.HasExited) { if (Test-Path `$log) { `$lines = Get-Content -LiteralPath `$log -ErrorAction SilentlyContinue; if (`$lines.Count -gt `$last) { `$lines[`$last..(`$lines.Count - 1)]; `$last = `$lines.Count } }; Start-Sleep -Seconds 1 }; if (Test-Path `$log) { `$lines = Get-Content -LiteralPath `$log -ErrorAction SilentlyContinue; if (`$lines.Count -gt `$last) { `$lines[`$last..(`$lines.Count - 1)] } }; exit `$p.ExitCode"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "`$exe = Join-Path (Get-Location) '$AppName.exe'; `$logsDir = Join-Path `$env:LOCALAPPDATA 'boku-no-translator\logs'; `$log = Join-Path `$logsDir 'preload_models.log'; `$appLog = Join-Path `$logsDir 'app.log'; Remove-Item -LiteralPath `$log -Force -ErrorAction SilentlyContinue; `$p = Start-Process -FilePath `$exe -ArgumentList '--preload-models' -PassThru; `$last = 0; while (-not `$p.HasExited) { if (Test-Path `$log) { `$lines = Get-Content -LiteralPath `$log -ErrorAction SilentlyContinue; if (`$lines.Count -gt `$last) { `$lines[`$last..(`$lines.Count - 1)]; `$last = `$lines.Count } }; Start-Sleep -Seconds 1 }; if (Test-Path `$log) { `$lines = Get-Content -LiteralPath `$log -ErrorAction SilentlyContinue; if (`$lines.Count -gt `$last) { `$lines[`$last..(`$lines.Count - 1)] } }; `$code = `$p.ExitCode; if (`$code -ne 0) { `$hex = ('{0:X8}' -f (`$code -band 0xffffffff)); Write-Host ('[preload] app exited with code {0} (0x{1})' -f `$code, `$hex); if (Test-Path `$appLog) { Write-Host '[preload] app.log tail:'; Get-Content -LiteralPath `$appLog -Tail 80 -ErrorAction SilentlyContinue }; exit `$code }; exit 0"
 pause
 "@ | Set-Content -LiteralPath $PreloadBat -Encoding ASCII
 

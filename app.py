@@ -4197,6 +4197,8 @@ class CaptureController:
         return active_devices or ["cpu"]
 
     def start_workers(self):
+        self.worker_shutdown_requested = False
+        self.reported_worker_exits = set()
         self.active_devices = self._active_devices_from_config()
         print("Active devices:", self.active_devices, flush=True)
         self.in_queues = []
@@ -4302,6 +4304,41 @@ class CaptureController:
             flush=True,
         )
         self.update_overlay_model_status(model)
+
+    def check_worker_health(self):
+        if getattr(self, "worker_shutdown_requested", False):
+            return
+        reported = getattr(self, "reported_worker_exits", set())
+        for idx, proc in enumerate(list(self.workers)):
+            exitcode = proc.exitcode
+            if exitcode is None or idx in reported:
+                continue
+            reported.add(idx)
+            device = self.active_devices[idx] if idx < len(self.active_devices) else "unknown"
+            message = f"OCR worker exited unexpectedly with code {exitcode}"
+            log_message(f"[worker] {device} {message}")
+            self.handle_model_status(
+                {
+                    "type": "model_status",
+                    "device": device,
+                    "model": "ocr",
+                    "status": "error",
+                    "message": message,
+                }
+            )
+            translation_device = resolve_translation_device(asdict(self.config))
+            translation_state = self.model_status_by_device.get(str(translation_device), {}).get("translation", {})
+            if str(translation_state.get("status", "unknown") or "unknown").lower() in {"unknown", "loading"}:
+                self.handle_model_status(
+                    {
+                        "type": "model_status",
+                        "device": str(translation_device),
+                        "model": "translation",
+                        "status": "error",
+                        "message": f"translation preload stopped because OCR worker exited with code {exitcode}",
+                    }
+                )
+        self.reported_worker_exits = reported
 
     def restart_workers(self):
         self.stop(clear_overlay=False)
@@ -4485,8 +4522,10 @@ class CaptureController:
 
             self.overlay.set_items(items)
             self.writer.write(items, {"device": device, "elapsed_ms": elapsed, "frame_id": frame_id, "bboxes": len(items)})
+        self.check_worker_health()
 
     def stop(self, clear_overlay: bool = True):
+        self.worker_shutdown_requested = True
         for iq in self.in_queues:
             try:
                 iq.put(None)
@@ -5425,7 +5464,9 @@ def preload_paddle_models(config: AppConfig):
             try:
                 if paddle_device != device:
                     preload_message(f"[preload] retrying PaddleOCR with device alias={paddle_device}")
+                preload_message(f"[preload] creating PaddleOCR instance on {paddle_device}")
                 ocr, api_version = create_paddle_ocr(config_dict, paddle_device)
+                preload_message(f"[preload] warming up PaddleOCR on {paddle_device}")
                 warmup_paddle_ocr(ocr, config_dict)
                 device = paddle_device
                 break
