@@ -104,10 +104,6 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 and type ```A```
 
-```powershell
-.\build_app.ps1
-```
-
 `build_app.ps1` creates `.venv` automatically. If Python 3.11 is missing, it tries to install Python 3.11 with `winget`. If `winget` is unavailable or does not expose Python after install, the script downloads the official Python 3.11 Windows installer from python.org and installs it silently for the current user.
 
 By default, the build script also prepares the Python-side CUDA runtime used by the bundled app:
