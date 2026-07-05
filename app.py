@@ -83,12 +83,49 @@ MODEL_CACHE_DIR = USER_DATA_DIR / "models"
 LOG_DIR = USER_DATA_DIR / "logs"
 APP_LOG_PATH = LOG_DIR / "app.log"
 PRELOAD_LOG_PATH = LOG_DIR / "preload_models.log"
+STDOUT_LOG_PATH = LOG_DIR / "stdout.log"
+STDERR_LOG_PATH = LOG_DIR / "stderr.log"
 APP_ICON_PATH = RESOURCE_DIR / "assets" / "app.ico"
 DEFAULT_JAPANESE_AUX_SYMBOL_CHARS = (
     "「 」 『 』 、。【 】 〈 〉 《 》 〔 〕 ［ ］ ｛ ｝"
 )
 DLL_DIRECTORY_HANDLES = []
 PRELOADED_DLL_HANDLES = []
+
+
+class SafeLogStream:
+    encoding = "utf-8"
+    errors = "replace"
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    def write(self, text):
+        if text is None:
+            return 0
+        text = str(text)
+        if not text:
+            return 0
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def ensure_stdio_streams():
+    if sys.stdout is None:
+        sys.stdout = SafeLogStream(STDOUT_LOG_PATH)
+    if sys.stderr is None:
+        sys.stderr = SafeLogStream(STDERR_LOG_PATH)
 
 
 def log_message(message: str):
@@ -102,11 +139,14 @@ def log_message(message: str):
 
 
 def preload_message(message: str):
-    print(message, flush=True)
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         with PRELOAD_LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(f"{message}\n")
+    except Exception:
+        pass
+    try:
+        print(message, flush=True)
     except Exception:
         pass
 
@@ -115,8 +155,12 @@ def configure_runtime_environment():
     USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_stdio_streams()
     os.environ.setdefault("HF_HOME", str(MODEL_CACHE_DIR / "huggingface"))
     os.environ.setdefault("HF_HUB_CACHE", str(MODEL_CACHE_DIR / "huggingface" / "hub"))
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(MODEL_CACHE_DIR / "paddlex"))
     os.environ.setdefault("PADDLE_HOME", str(MODEL_CACHE_DIR / "paddle"))
     os.environ.setdefault("PADDLEOCR_HOME", str(MODEL_CACHE_DIR / "paddleocr"))
