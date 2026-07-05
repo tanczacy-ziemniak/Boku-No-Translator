@@ -446,6 +446,78 @@ function Find-VisualStudioWithVCTools {
     return $null
 }
 
+function Get-VcVars64Path {
+    $InstallPath = Find-VisualStudioWithVCTools
+    if (-not $InstallPath) {
+        return $null
+    }
+    $Candidates = @(
+        (Join-Path $InstallPath "VC\Auxiliary\Build\vcvars64.bat"),
+        (Join-Path $InstallPath "Common7\Tools\VsDevCmd.bat")
+    )
+    foreach ($Candidate in $Candidates) {
+        if (Test-Path $Candidate) {
+            return $Candidate
+        }
+    }
+    return $null
+}
+
+function Import-BatchEnvironment {
+    param(
+        [Parameter(Mandatory=$true)][string]$BatchFile,
+        [string]$Arguments = ""
+    )
+    $Command = "`"$BatchFile`" $Arguments >nul && set"
+    $Output = & cmd.exe /s /c $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to import Visual Studio build environment from $BatchFile"
+    }
+    foreach ($Line in $Output) {
+        $Index = $Line.IndexOf("=")
+        if ($Index -le 0) {
+            continue
+        }
+        $Name = $Line.Substring(0, $Index)
+        $Value = $Line.Substring($Index + 1)
+        [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+    }
+}
+
+function Ensure-VisualStudioCompilerEnvironment {
+    $ExistingCl = Get-Command cl.exe -ErrorAction SilentlyContinue
+    if ($ExistingCl) {
+        Write-Host "  MSVC compiler: $($ExistingCl.Source)"
+        $env:CC = "cl.exe"
+        $env:CXX = "cl.exe"
+        return
+    }
+
+    if (-not (Find-VisualStudioWithVCTools)) {
+        $Installed = Invoke-WingetInstall `
+            -PackageId $VsBuildToolsWingetId `
+            -ExtraArgs @("--override", "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended")
+        if (-not $Installed -or -not (Find-VisualStudioWithVCTools)) {
+            throw "Visual Studio 2022 Build Tools with C++ workload was not found. Install it, then rerun build_app.ps1."
+        }
+    }
+
+    $VcVars = Get-VcVars64Path
+    if (-not $VcVars) {
+        throw "Could not find vcvars64.bat or VsDevCmd.bat in the Visual Studio Build Tools installation."
+    }
+    Write-Host "  Loading MSVC build environment: $VcVars"
+    Import-BatchEnvironment -BatchFile $VcVars -Arguments "x64"
+
+    $Cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+    if (-not $Cl) {
+        throw "cl.exe was not found after loading the Visual Studio build environment."
+    }
+    $env:CC = "cl.exe"
+    $env:CXX = "cl.exe"
+    Write-Host "  MSVC compiler: $($Cl.Source)"
+}
+
 function Invoke-WingetInstall {
     param(
         [Parameter(Mandatory=$true)][string]$PackageId,
@@ -463,15 +535,10 @@ function Invoke-WingetInstall {
 function Ensure-LlamaSourceBuildPrerequisites {
     Write-Host "Preparing llama-cpp-python CUDA source build prerequisites..."
     & $Python -m pip install --upgrade cmake ninja scikit-build-core setuptools wheel
-
-    if (-not (Find-VisualStudioWithVCTools)) {
-        $Installed = Invoke-WingetInstall `
-            -PackageId $VsBuildToolsWingetId `
-            -ExtraArgs @("--override", "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended")
-        if (-not $Installed -or -not (Find-VisualStudioWithVCTools)) {
-            throw "Visual Studio 2022 Build Tools with C++ workload was not found. Install it, then rerun build_app.ps1."
-        }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install Python build packages required for llama-cpp-python source build."
     }
+    Ensure-VisualStudioCompilerEnvironment
 
     $Nvcc = Find-Nvcc
     if (-not $Nvcc) {
@@ -497,6 +564,9 @@ function Install-LlamaCudaWheel {
     Write-Host "Installing CUDA-enabled llama-cpp-python wheel..."
     Write-Host "  index: $EffectiveLlamaCudaWheelIndex"
     & $Python -m pip install --upgrade --force-reinstall --prefer-binary --no-deps --index-url $EffectiveLlamaCudaWheelIndex "llama-cpp-python==$LlamaCppPythonVersion"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install CUDA llama-cpp-python wheel from $EffectiveLlamaCudaWheelIndex."
+    }
 }
 
 function Install-LlamaCudaFromSource {
@@ -515,6 +585,9 @@ function Install-LlamaCudaFromSource {
         $env:CMAKE_GENERATOR = "Ninja"
         & $Python -m pip uninstall -y llama-cpp-python
         & $Python -m pip install --upgrade --force-reinstall --no-cache-dir --no-deps --no-binary=llama-cpp-python "llama-cpp-python==$LlamaCppPythonVersion"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to build llama-cpp-python with CUDA from source. Check that MSVC Build Tools and CUDA Toolkit are installed and usable."
+        }
     } finally {
         $env:CMAKE_ARGS = $OldCmakeArgs
         $env:FORCE_CMAKE = $OldForceCmake
@@ -615,12 +688,24 @@ except Exception:
     traceback.print_exc()
     sys.exit(1)
 "@
-    $Output = & $Python -c $Probe 2>&1
-    $ExitCode = $LASTEXITCODE
-    foreach ($Line in $Output) {
-        Write-Host "  $Line"
+    $ProbePath = Join-Path ([System.IO.Path]::GetTempPath()) ("boku_llama_probe_{0}.py" -f ([Guid]::NewGuid().ToString("N")))
+    $StdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ("boku_llama_probe_{0}.out" -f ([Guid]::NewGuid().ToString("N")))
+    $StderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ("boku_llama_probe_{0}.err" -f ([Guid]::NewGuid().ToString("N")))
+    try {
+        Set-Content -LiteralPath $ProbePath -Value $Probe -Encoding UTF8
+        & $Python $ProbePath 1>$StdoutPath 2>$StderrPath
+        $ExitCode = $LASTEXITCODE
+        foreach ($Path in @($StdoutPath, $StderrPath)) {
+            if (Test-Path $Path) {
+                foreach ($Line in (Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue)) {
+                    Write-Host "  $Line"
+                }
+            }
+        }
+        return ($ExitCode -eq 0)
+    } finally {
+        Remove-Item -LiteralPath $ProbePath, $StdoutPath, $StderrPath -Force -ErrorAction SilentlyContinue
     }
-    return ($ExitCode -eq 0)
 }
 
 function Confirm-LlamaCppGpuOffload {
