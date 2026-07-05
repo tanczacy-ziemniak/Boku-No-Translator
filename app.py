@@ -307,23 +307,33 @@ def configure_llama_cpp_dlls():
     roots = llama_cpp_runtime_roots()
     for root in roots:
         add_dll_search_dir(root / "llama_cpp" / "lib")
+        add_dll_search_dir(root / "bin")
 
     for root in roots:
-        lib_dir = root / "llama_cpp" / "lib"
-        if not lib_dir.exists():
-            continue
-        for dll_name in ("ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll", "ggml.dll", "llama.dll", "mtmd.dll"):
-            dll_path = lib_dir / dll_name
-            if not dll_path.exists():
+        for lib_dir in (root / "llama_cpp" / "lib", root / "bin"):
+            if not lib_dir.exists():
                 continue
-            normalized = str(dll_path.resolve())
-            if any(existing == normalized for existing, _ in PRELOADED_DLL_HANDLES):
-                continue
-            try:
-                handle = ctypes.CDLL(normalized, winmode=ctypes.RTLD_GLOBAL)
-                PRELOADED_DLL_HANDLES.append((normalized, handle))
-            except Exception as exc:
-                print(f"[translate] DLL preload skipped: {dll_path.name}: {repr(exc)}", flush=True)
+            for dll_name in ("ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll", "ggml.dll", "llama.dll", "mtmd.dll"):
+                dll_path = lib_dir / dll_name
+                if not dll_path.exists():
+                    continue
+                normalized = str(dll_path.resolve())
+                if any(existing == normalized for existing, _ in PRELOADED_DLL_HANDLES):
+                    continue
+                try:
+                    handle = ctypes.CDLL(normalized, winmode=ctypes.RTLD_GLOBAL)
+                    PRELOADED_DLL_HANDLES.append((normalized, handle))
+                except Exception as exc:
+                    print(f"[translate] DLL preload skipped: {dll_path.name}: {repr(exc)}", flush=True)
+            for dll_path in sorted(lib_dir.glob("*.dll")):
+                normalized = str(dll_path.resolve())
+                if any(existing == normalized for existing, _ in PRELOADED_DLL_HANDLES):
+                    continue
+                try:
+                    handle = ctypes.CDLL(normalized)
+                    PRELOADED_DLL_HANDLES.append((normalized, handle))
+                except Exception as exc:
+                    print(f"[translate] DLL preload skipped: {dll_path.name}: {repr(exc)}", flush=True)
 
 
 def ensure_user_config_file():

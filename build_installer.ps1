@@ -5,7 +5,8 @@ param(
     [ValidateSet("auto", "cpu", "standard", "blackwell", "cuda118", "cuda126", "cuda129")]
     [string]$PaddleGpuRuntime = "auto",
     [ValidateSet("auto", "wheel", "source", "skip")]
-    [string]$LlamaCudaInstallMode = "auto"
+    [string]$LlamaCudaInstallMode = "auto",
+    [switch]$RequireLlamaCuda
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +27,9 @@ if (-not $SkipAppBuild) {
     $BuildArgs = @("-PaddleGpuRuntime", $PaddleGpuRuntime, "-LlamaCudaInstallMode", $LlamaCudaInstallMode)
     if ($CpuOnly) {
         $BuildArgs += "-CpuOnly"
+    }
+    if ($RequireLlamaCuda) {
+        $BuildArgs += "-RequireLlamaCuda"
     }
     & (Join-Path $AppDir "build_app.ps1") @BuildArgs
 }

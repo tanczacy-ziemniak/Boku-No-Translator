@@ -10,6 +10,7 @@ param(
     [ValidateSet("auto", "wheel", "source", "skip")]
     [string]$LlamaCudaInstallMode = "auto",
     [string]$LlamaCppPythonVersion = "0.3.32",
+    [switch]$RequireLlamaCuda,
     [string]$LlamaCudaWheelIndex = "",
     [string]$DefaultLlamaCudaWheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu124",
     [string]$BlackwellLlamaCudaWheelIndex = "",
@@ -32,6 +33,7 @@ $Python = Join-Path $VenvDir "Scripts\python.exe"
 $SitePackages = Join-Path $VenvDir "Lib\site-packages"
 $NvidiaCudnnDir = Join-Path $SitePackages "nvidia\cudnn"
 $LlamaLibDir = Join-Path $SitePackages "llama_cpp\lib"
+$SitePackagesBinDir = Join-Path $SitePackages "bin"
 
 function Find-Python311 {
     $Candidates = @(
@@ -520,6 +522,126 @@ function Install-LlamaCudaFromSource {
     }
 }
 
+function Get-LlamaCppLibrarySummary {
+    $Locations = @($LlamaLibDir, $SitePackagesBinDir)
+    $Rows = @()
+    foreach ($Location in $Locations) {
+        if (-not (Test-Path $Location)) {
+            $Rows += "$($Location): missing"
+            continue
+        }
+        $Dlls = Get-ChildItem -LiteralPath $Location -Filter "*.dll" -File -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
+        if (-not $Dlls) {
+            $Rows += "$($Location): no DLLs"
+        } else {
+            $Rows += "$($Location): $($Dlls -join ', ')"
+        }
+    }
+    return ($Rows -join " | ")
+}
+
+function Sync-LlamaCppBinaryDlls {
+    if (-not (Test-Path $SitePackagesBinDir)) {
+        return
+    }
+    New-Item -ItemType Directory -Force -Path $LlamaLibDir | Out-Null
+    $Names = @("ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll", "ggml.dll", "llama.dll", "mtmd.dll")
+    foreach ($Name in $Names) {
+        $Source = Join-Path $SitePackagesBinDir $Name
+        if (-not (Test-Path $Source)) {
+            continue
+        }
+        $Destination = Join-Path $LlamaLibDir $Name
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        Write-Host "Synced llama.cpp DLL: $Source -> $Destination"
+    }
+}
+
+function Test-LlamaCppGpuOffload {
+    $Probe = @"
+import ctypes
+import os
+import sys
+import traceback
+from pathlib import Path
+
+site = Path(r'''$SitePackages''')
+subdirs = [
+    "llama_cpp/lib",
+    "bin",
+    "nvidia/cublas/bin",
+    "nvidia/cuda_runtime/bin",
+    "nvidia/cudnn/bin",
+    "nvidia/cufft/bin",
+    "nvidia/curand/bin",
+    "nvidia/cusolver/bin",
+    "nvidia/cusparse/bin",
+    "nvidia/nvjitlink/bin",
+]
+
+for rel in subdirs:
+    path = site / rel
+    if not path.is_dir():
+        continue
+    try:
+        os.add_dll_directory(str(path))
+    except Exception:
+        pass
+    os.environ["PATH"] = str(path) + os.pathsep + os.environ.get("PATH", "")
+
+for rel in ("llama_cpp/lib", "bin"):
+    lib_dir = site / rel
+    for name in ("ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll", "ggml.dll", "llama.dll", "mtmd.dll"):
+        dll_path = lib_dir / name
+        if not dll_path.is_file():
+            continue
+        try:
+            ctypes.CDLL(str(dll_path))
+        except Exception:
+            pass
+
+try:
+    import llama_cpp
+    print("llama_cpp_file=" + str(Path(llama_cpp.__file__).resolve()))
+    supports = getattr(llama_cpp, "llama_supports_gpu_offload", None)
+    if not callable(supports):
+        print("llama_supports_gpu_offload=missing")
+        sys.exit(2)
+    ok = bool(supports())
+    print("llama_supports_gpu_offload=" + str(ok))
+    sys.exit(0 if ok else 3)
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+"@
+    $Output = & $Python -c $Probe 2>&1
+    $ExitCode = $LASTEXITCODE
+    foreach ($Line in $Output) {
+        Write-Host "  $Line"
+    }
+    return ($ExitCode -eq 0)
+}
+
+function Confirm-LlamaCppGpuOffload {
+    param([string]$Context = "llama-cpp-python")
+
+    Write-Host "Verifying CUDA llama.cpp GPU offload support ($Context)..."
+    if (Test-LlamaCppGpuOffload) {
+        Write-Host "CUDA llama.cpp GPU offload is available."
+        return $true
+    }
+
+    $Summary = Get-LlamaCppLibrarySummary
+    $Message = "CUDA llama.cpp GPU offload could not be verified. Libraries: $Summary"
+    if ($RequireLlamaCuda) {
+        throw $Message
+    }
+    Write-Warning $Message
+    Write-Warning "Continuing build. Translation may run on CPU or show a runtime error until llama-cpp-python is rebuilt with CUDA."
+    return $false
+}
+
 function Install-LlamaCppPythonCuda {
     if ($LlamaCudaInstallMode -eq "skip") {
         Write-Warning "Skipping CUDA llama-cpp-python installation by request."
@@ -543,11 +665,8 @@ function Install-LlamaCppPythonCuda {
         Install-LlamaCudaWheel
     }
 
-    $LlamaCudaDll = Join-Path $LlamaLibDir "ggml-cuda.dll"
-    if (-not (Test-Path $LlamaCudaDll)) {
-        throw "CUDA llama.cpp DLL was not found after installation: $LlamaCudaDll"
-    }
-    Write-Host "CUDA llama.cpp DLL ready: $LlamaCudaDll"
+    Sync-LlamaCppBinaryDlls
+    Confirm-LlamaCppGpuOffload -Context "after install" | Out-Null
 }
 
 function Ensure-CompatiblePythonPackages {
@@ -634,13 +753,11 @@ function Assert-GpuBuildInputs {
     if (-not (Test-Path $NvidiaCudnnDir)) {
         throw "nvidia-cudnn-cu12 was not found after automatic installation: $NvidiaCudnnDir"
     }
-    $LlamaCudaDll = Join-Path $LlamaLibDir "ggml-cuda.dll"
-    if (-not (Test-Path $LlamaCudaDll)) {
-        if ($LlamaCudaInstallMode -eq "skip") {
-            Write-Warning "CUDA llama.cpp DLL was not found because CUDA llama install was skipped: $LlamaCudaDll"
-        } else {
-            throw "CUDA llama.cpp DLL was not found: $LlamaCudaDll"
-        }
+    if ($LlamaCudaInstallMode -eq "skip") {
+        Write-Warning "CUDA llama.cpp verification was skipped by request."
+    } else {
+        Sync-LlamaCppBinaryDlls
+        Confirm-LlamaCppGpuOffload -Context "before PyInstaller packaging" | Out-Null
     }
 }
 

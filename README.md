@@ -209,6 +209,7 @@ Useful build options:
 .\build_app.ps1 -LlamaCudaInstallMode auto
 .\build_app.ps1 -LlamaCudaInstallMode source
 .\build_app.ps1 -LlamaCudaInstallMode wheel
+.\build_app.ps1 -RequireLlamaCuda
 .\build_app.ps1 -ForceBlackwellPaddle
 .\build_app.ps1 -Python311InstallerUrl "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
 .\build_app.ps1 -LlamaCudaWheelIndex "https://abetlen.github.io/llama-cpp-python/whl/cu124"
@@ -221,7 +222,7 @@ For RTX 5070 / 5080 / 5090 systems, the script should detect compute capability 
 .\build_app.ps1 -PaddleGpuRuntime cuda129
 ```
 
-For RTX 50 / Blackwell systems, `-LlamaCudaInstallMode auto` selects source build because the standard `llama-cpp-python` CUDA wheel index does not currently provide a CUDA 12.8/12.9 Windows wheel. If the build cannot install Visual Studio Build Tools or CUDA Toolkit automatically, install those once and rerun the same command.
+For RTX 50 / Blackwell systems, `-LlamaCudaInstallMode auto` selects source build because the standard `llama-cpp-python` CUDA wheel index does not currently provide a CUDA 12.8/12.9 Windows wheel. If the build cannot install Visual Studio Build Tools or CUDA Toolkit automatically, install those once and rerun the same command. By default, CUDA llama verification failure is a warning; add `-RequireLlamaCuda` when you want the build to fail unless GPU offload is verified.
 
 The packaged ZIP contains one Paddle runtime selected at build time. If you build on one GPU family and move the ZIP to a very different GPU family, rebuild on the target PC or pass the matching `-PaddleGpuRuntime` option.
 
