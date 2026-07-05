@@ -22,6 +22,7 @@
 
 ## Description
 Real-time translator for games powered by local OCR and a local AI translation model.
+Don't forget to Star ⭐️ this repository to keep track of updates!
 
 
 ## Demo
