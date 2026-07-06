@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sanity:
+    name: Sanity checks
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check Python syntax
+        shell: pwsh
+        run: |
+          python -m py_compile app.py installer_stub.py
+
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = @(
+            "build_app.ps1",
+            "build_installer.ps1",
+            "install_ctrl_alt_a_shortcut.ps1"
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              foreach ($errorItem in $errors) {
+                Write-Error "$file line $($errorItem.Extent.StartLineNumber): $($errorItem.Message)"
+              }
+              exit 1
+            }
+          }
+
+      - name: Check required package files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $required = @(
+            "README.md",
+            "LICENSE.md",
+            "requirements.txt",
+            "config.yaml",
+            "app.py",
+            "installer_stub.py",
+            "build_app.bat",
+            "build_app.ps1",
+            "build_installer.ps1",
+            "assets/app.ico",
+            "assets/app-icon.png"
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "Required file is missing: $path"
+            }
+          }
+          if (Test-Path -LiteralPath "run_app.bat") {
+            throw "run_app.bat should not be shipped from source. Use build_app.bat instead."
+          }

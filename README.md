@@ -196,6 +196,25 @@ boku-no-translator.exe --preload-models
 
 The ZIP also includes `preload_models.bat`, which runs the same command and keeps the console open so you can see progress and errors.
 
+## CI/CD
+
+This repository includes GitHub Actions workflows:
+
+- `CI`: runs automatically on pushes and pull requests. It checks Python syntax, PowerShell script syntax, and required package files.
+- `Build Release`: runs manually or when a tag like `v1.0.0` is pushed. It builds a Windows CPU package, uploads it as a workflow artifact, and attaches it to a GitHub Release for version tags.
+- `Build GPU Release (self-hosted)`: runs manually on your own Windows NVIDIA GPU runner. Use this for CUDA packages such as `cuda118`, `cuda126`, and `cuda129`.
+
+To publish a CPU release:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Then open GitHub > Actions > `Build Release`. When it finishes, the ZIP and `.sha256` checksum will be attached to the GitHub Release.
+
+GPU release builds need a self-hosted Windows runner with an NVIDIA GPU, NVIDIA driver, and the runner label `nvidia-gpu`. After that runner is online, open GitHub > Actions > `Build GPU Release (self-hosted)` and choose the Paddle runtime.
+
 ## Devices
 
 The app auto-detects NVIDIA GPUs at startup:

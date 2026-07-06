@@ -1,0 +1,73 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-cpu:
+    name: Build Windows CPU package
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build packaged app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          .\build_app.ps1 -CpuOnly -PaddleGpuRuntime cpu -LlamaCudaInstallMode skip
+
+      - name: Create release archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $refName = "${{ github.ref_name }}" -replace "[^A-Za-z0-9._-]", "-"
+          if (-not $refName) {
+            $refName = "manual"
+          }
+          $zipPath = "boku-no-translator-windows-cpu-$refName.zip"
+          Compress-Archive -Path "dist\boku-no-translator" -DestinationPath $zipPath -Force
+          Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath |
+            ForEach-Object { "$($_.Hash)  $zipPath" } |
+            Set-Content -LiteralPath "$zipPath.sha256" -Encoding ASCII
+          "BOKU_RELEASE_ZIP=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "BOKU_RELEASE_SHA=$zipPath.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boku-no-translator-windows-cpu
+          path: |
+            ${{ env.BOKU_RELEASE_ZIP }}
+            ${{ env.BOKU_RELEASE_SHA }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag `
+              --title $tag `
+              --notes "Automated Windows CPU build for Boku No Translator." `
+              $env:BOKU_RELEASE_ZIP `
+              $env:BOKU_RELEASE_SHA
+          } else {
+            gh release upload $tag `
+              $env:BOKU_RELEASE_ZIP `
+              $env:BOKU_RELEASE_SHA `
+              --clobber
+          }
