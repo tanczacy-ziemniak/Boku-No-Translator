@@ -90,19 +90,18 @@ Supporters who want to be credited can leave a display name or message. When the
 Official release supporters will be listed here. Listing is opt-in, so only names or handles provided for credit will be added.
 
 ## How to use
-Build the packaged app:
+Build the packaged app from the source ZIP:
 
-Open Powershell first. 
+1. Extract the ZIP first. Do not run it from inside the compressed folder.
+2. Double-click `build_app.bat`.
+3. Keep the window open until it says `Build finished`.
 
-Head to directory you saved the source files. or type ```cd``` and drag the folder.
+`build_app.bat` opens PowerShell with a temporary execution-policy bypass, starts `build_app.ps1`, and chooses the GPU runtime automatically:
 
-And then type.
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
-
-and type ```A```
+- RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090: Paddle CUDA 12.9 and llama.cpp CUDA source build
+- RTX/GTX 20, 30, and 40 series GPUs: Paddle CUDA 12.6 and llama.cpp CUDA auto mode
+- Older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards: Paddle CUDA 11.8 and llama.cpp CUDA auto mode
+- No detected NVIDIA GPU: CPU Paddle runtime
 
 `build_app.ps1` creates `.venv` automatically. If Python 3.11 is missing, it tries to install Python 3.11 with `winget`. If `winget` is unavailable or does not expose Python after install, the script downloads the official Python 3.11 Windows installer from python.org and installs it silently for the current user.
 
@@ -111,19 +110,26 @@ By default, the build script also prepares the Python-side CUDA runtime used by 
 - installs NVIDIA CUDA/cuDNN Python wheels such as `nvidia-cudnn-cu12`
 - installs CUDA-enabled `llama-cpp-python`; RTX 20/30/40 class GPUs use the configured CUDA wheel index, while RTX 50 / Blackwell builds from source automatically
 - detects NVIDIA GPUs with `nvidia-smi` and selects the Paddle runtime automatically
-- uses Paddle CUDA 12.9 for RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090
+
+Advanced manual build commands:
+
+Paddle CUDA 12.9 for RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090:
+
 ```powershell
 .\build_app.ps1 -PaddleGpuRuntime cuda129 -LlamaCudaInstallMode source -RequireLlamaCuda
 ```
-- uses Paddle CUDA 12.6 for modern RTX/GTX GPUs such as RTX 20, 30, and 40 series
+
+Paddle CUDA 12.6 for modern RTX/GTX GPUs such as RTX 20, 30, and 40 series:
+
 ```powershell
 .\build_app.ps1 -PaddleGpuRuntime cuda126 -LlamaCudaInstallMode auto -RequireLlamaCuda
 ```
-- uses Paddle CUDA 11.8 for older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards
+
+Paddle CUDA 11.8 for older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards:
+
 ```powershell
 .\build_app.ps1 -PaddleGpuRuntime cuda118 -LlamaCudaInstallMode auto -RequireLlamaCuda
 ```
-- falls back to CPU Paddle when no NVIDIA GPU is detected
 
 NVIDIA display drivers are not installed by the script. Install or update the NVIDIA driver separately if `nvidia-smi` is not available. RTX 50 / Blackwell translation GPU support also needs a CUDA source build of `llama-cpp-python`; the script tries to prepare Visual Studio Build Tools and CUDA Toolkit with `winget` when they are missing.
 
@@ -153,9 +159,11 @@ The app executable is created at:
 dist\boku-no-translator\boku-no-translator.exe
 ```
 
-before to execute ```boku-no-translator.exe```,
+Before running `boku-no-translator.exe`, run this once:
 
-execute ```dist\boku-no-translator\preload_models.bat``` first.
+```text
+dist\boku-no-translator\preload_models.bat
+```
 
 
 ## Hotkeys
