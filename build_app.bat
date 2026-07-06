@@ -11,10 +11,10 @@ echo   %~dp0dist\boku-no-translator
 echo.
 echo GPU runtime is selected automatically:
 echo   RTX 50 / Blackwell  - Paddle CUDA 12.9, llama.cpp CUDA source build
-echo   RTX 20/30/40 series - Paddle CUDA 12.6, llama.cpp CUDA auto mode
-echo   GTX 10 / Tesla P/V  - Paddle CUDA 11.8, llama.cpp CUDA auto mode
+echo   RTX 20/30/40 series - Paddle CUDA 12.6, llama.cpp CUDA wheel with source fallback
+echo   GTX 10 / Tesla P/V  - Paddle CUDA 11.8, llama.cpp CUDA wheel with source fallback
 echo.
-echo Keep this window open. The first build can take a long time.
+echo Keep this window open. The first build can take a long time, especially if source fallback is needed.
 echo.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^

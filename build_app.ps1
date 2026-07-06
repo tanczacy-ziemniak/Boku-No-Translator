@@ -585,7 +585,7 @@ function Install-LlamaCudaWheel {
     }
     Write-Host "Installing CUDA-enabled llama-cpp-python wheel..."
     Write-Host "  index: $EffectiveLlamaCudaWheelIndex"
-    & $Python -m pip install --upgrade --force-reinstall --prefer-binary --no-deps --index-url $EffectiveLlamaCudaWheelIndex "llama-cpp-python==$LlamaCppPythonVersion"
+    & $Python -m pip install --upgrade --force-reinstall --no-cache-dir --prefer-binary --no-deps --index-url $EffectiveLlamaCudaWheelIndex "llama-cpp-python==$LlamaCppPythonVersion"
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to install CUDA llama-cpp-python wheel from $EffectiveLlamaCudaWheelIndex."
     }
@@ -739,7 +739,10 @@ except Exception:
 }
 
 function Confirm-LlamaCppGpuOffload {
-    param([string]$Context = "llama-cpp-python")
+    param(
+        [string]$Context = "llama-cpp-python",
+        [switch]$NoThrow
+    )
 
     Write-Host "Verifying CUDA llama.cpp GPU offload support ($Context)..."
     if (Test-LlamaCppGpuOffload) {
@@ -749,10 +752,13 @@ function Confirm-LlamaCppGpuOffload {
 
     $Summary = Get-LlamaCppLibrarySummary
     $Message = "CUDA llama.cpp GPU offload could not be verified. Libraries: $Summary"
-    if ($RequireLlamaCuda) {
+    if ($RequireLlamaCuda -and -not $NoThrow) {
         throw $Message
     }
     Write-Warning $Message
+    if ($NoThrow) {
+        return $false
+    }
     Write-Warning "Continuing build. Translation may run on CPU or show a runtime error until llama-cpp-python is rebuilt with CUDA."
     return $false
 }
@@ -769,19 +775,38 @@ function Install-LlamaCppPythonCuda {
         return
     }
 
-    $Mode = $LlamaCudaInstallMode
+    $RequestedMode = $LlamaCudaInstallMode
+    $Mode = $RequestedMode
     if ($Mode -eq "auto") {
         $Mode = if ($RuntimePlan.Mode -eq "cuda129") { "source" } else { "wheel" }
     }
 
     if ($Mode -eq "source") {
         Install-LlamaCudaFromSource
-    } else {
-        Install-LlamaCudaWheel
+        Sync-LlamaCppBinaryDlls
+        Confirm-LlamaCppGpuOffload -Context "after source install" | Out-Null
+        return
     }
 
+    Install-LlamaCudaWheel
     Sync-LlamaCppBinaryDlls
-    Confirm-LlamaCppGpuOffload -Context "after install" | Out-Null
+    if (Confirm-LlamaCppGpuOffload -Context "after wheel install" -NoThrow) {
+        return
+    }
+
+    if ($RequestedMode -eq "auto") {
+        Write-Warning "CUDA llama.cpp wheel verification failed. Falling back to a local CUDA source build. This can take a long time."
+        Install-LlamaCudaFromSource
+        Sync-LlamaCppBinaryDlls
+        Confirm-LlamaCppGpuOffload -Context "after source fallback" | Out-Null
+        return
+    }
+
+    if ($RequireLlamaCuda) {
+        throw "CUDA llama.cpp GPU offload could not be verified after the requested wheel install. Try rerunning with -LlamaCudaInstallMode source."
+    } else {
+        Write-Warning "Continuing after requested wheel install failed CUDA verification."
+    }
 }
 
 function Ensure-CompatiblePythonPackages {

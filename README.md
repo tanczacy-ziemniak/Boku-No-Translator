@@ -99,8 +99,8 @@ Build the packaged app from the source ZIP:
 `build_app.bat` opens PowerShell with a temporary execution-policy bypass, starts `build_app.ps1`, and chooses the GPU runtime automatically:
 
 - RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090: Paddle CUDA 12.9 and llama.cpp CUDA source build
-- RTX/GTX 20, 30, and 40 series GPUs: Paddle CUDA 12.6 and llama.cpp CUDA auto mode
-- Older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards: Paddle CUDA 11.8 and llama.cpp CUDA auto mode
+- RTX/GTX 20, 30, and 40 series GPUs: Paddle CUDA 12.6 and llama.cpp CUDA wheel, with source build fallback if GPU offload cannot be verified
+- Older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards: Paddle CUDA 11.8 and llama.cpp CUDA wheel, with source build fallback if GPU offload cannot be verified
 - No detected NVIDIA GPU: CPU Paddle runtime
 
 `build_app.ps1` creates `.venv` automatically. If Python 3.11 is missing, it tries to install Python 3.11 with `winget`. If `winget` is unavailable or does not expose Python after install, the script downloads the official Python 3.11 Windows installer from python.org and installs it silently for the current user.
@@ -108,7 +108,7 @@ Build the packaged app from the source ZIP:
 By default, the build script also prepares the Python-side CUDA runtime used by the bundled app:
 
 - installs NVIDIA CUDA/cuDNN Python wheels such as `nvidia-cudnn-cu12`
-- installs CUDA-enabled `llama-cpp-python`; RTX 20/30/40 class GPUs use the configured CUDA wheel index, while RTX 50 / Blackwell builds from source automatically
+- installs CUDA-enabled `llama-cpp-python`; RTX 20/30/40 class GPUs try the configured CUDA wheel index first and then fall back to a local CUDA source build if GPU offload cannot be verified, while RTX 50 / Blackwell builds from source automatically
 - detects NVIDIA GPUs with `nvidia-smi` and selects the Paddle runtime automatically
 
 Advanced manual build commands:
@@ -132,6 +132,8 @@ Paddle CUDA 11.8 for older supported NVIDIA GPUs such as Pascal/Volta class GTX 
 ```
 
 NVIDIA display drivers are not installed by the script. Install or update the NVIDIA driver separately if `nvidia-smi` is not available. RTX 50 / Blackwell translation GPU support also needs a CUDA source build of `llama-cpp-python`; the script tries to prepare Visual Studio Build Tools and CUDA Toolkit with `winget` when they are missing.
+
+If the build previously stopped with `CUDA llama.cpp GPU offload could not be verified`, update the source files and run `build_app.bat` again. The script now disables pip's wheel cache for the CUDA wheel and automatically retries with a local CUDA source build in `auto` mode.
 
 Useful build options:
 
