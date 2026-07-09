@@ -12,6 +12,8 @@ param(
     [string]$LlamaCppPythonVersion = "0.3.32",
     [switch]$RequireLlamaCuda,
     [string]$LlamaCudaWheelIndex = "",
+    [string]$LlamaPipTempDir = "",
+    [string]$LlamaCudaToolkitRoot = "",
     [string]$DefaultLlamaCudaWheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/cu124",
     [string]$BlackwellLlamaCudaWheelIndex = "",
     [string]$PaddleCpuIndexUrl = "https://www.paddlepaddle.org.cn/packages/stable/cpu/",
@@ -197,6 +199,24 @@ function Get-ComputeCapabilityFromGpuName {
     return $null
 }
 
+function Get-ConsumerGpuRuntimeModeFromName {
+    param([string]$Name)
+    if (-not $Name) {
+        return $null
+    }
+
+    if ($Name -match "RTX\s+50|Blackwell") {
+        return "cuda129"
+    }
+    if ($Name -match "RTX\s+40|RTX\s+30|RTX\s+20|Quadro\s+RTX|Titan\s+RTX") {
+        return "cuda126"
+    }
+    if ($Name -match "GTX\s+16|GTX\s+10|GTX\s+9|GTX\s+8|GTX\s+7|GTX\s+6|GT\s+\d|Titan\s+Xp|Titan\s+X") {
+        return "cuda118"
+    }
+    return $null
+}
+
 function Get-NvidiaGpuInfos {
     $Candidates = @("nvidia-smi")
     if ($env:SystemRoot) {
@@ -326,6 +346,36 @@ function Get-PaddleGpuRuntimePlan {
     }
 
     foreach ($Info in $Infos) {
+        if ((Get-ConsumerGpuRuntimeModeFromName -Name $Info.Name) -eq "cuda129") {
+            return New-PaddleGpuRuntimePlan `
+                -Mode "cuda129" `
+                -Reason "Detected NVIDIA RTX 50/Blackwell GPU: $($Info.Name)." `
+                -PaddleIndexUrl $PaddleCuda129IndexUrl `
+                -CudaLabel "CUDA 12.9"
+        }
+    }
+
+    foreach ($Info in $Infos) {
+        if ((Get-ConsumerGpuRuntimeModeFromName -Name $Info.Name) -eq "cuda126") {
+            return New-PaddleGpuRuntimePlan `
+                -Mode "cuda126" `
+                -Reason "Detected NVIDIA RTX 20/30/40 GPU: $($Info.Name)." `
+                -PaddleIndexUrl $PaddleCuda126IndexUrl `
+                -CudaLabel "CUDA 12.6"
+        }
+    }
+
+    foreach ($Info in $Infos) {
+        if ((Get-ConsumerGpuRuntimeModeFromName -Name $Info.Name) -eq "cuda118") {
+            return New-PaddleGpuRuntimePlan `
+                -Mode "cuda118" `
+                -Reason "Detected pre-RTX 20 consumer NVIDIA GPU: $($Info.Name)." `
+                -PaddleIndexUrl $PaddleCuda118IndexUrl `
+                -CudaLabel "CUDA 11.8"
+        }
+    }
+
+    foreach ($Info in $Infos) {
         if (($null -ne $Info.ComputeCapability -and $Info.ComputeCapability -ge 12.0) -or $Info.Name -match "RTX\s+50|Blackwell") {
             return New-PaddleGpuRuntimePlan `
                 -Mode "cuda129" `
@@ -428,13 +478,65 @@ function Get-CudaArchitectureForLlamaBuild {
     return ([int][Math]::Round($Compute * 10)).ToString()
 }
 
+function Get-PreferredCudaToolkitMajorForLlamaBuild {
+    $RuntimePlan = Get-PaddleGpuRuntimePlan
+    if ($RuntimePlan.Mode -eq "cpu") {
+        return $null
+    }
+    if ($RuntimePlan.Mode -eq "cuda118") {
+        return 11
+    }
+    return 12
+}
+
+function Get-RequiredCudaToolkitVersionForLlamaBuild {
+    $RuntimePlan = Get-PaddleGpuRuntimePlan
+    switch ($RuntimePlan.Mode) {
+        "cuda129" { return "12.9" }
+        "cuda126" { return "12.6" }
+        "cuda118" { return "11.8" }
+        default { return $null }
+    }
+}
+
+function Get-RequiredCudaToolkitLabelForLlamaBuild {
+    $Version = Get-RequiredCudaToolkitVersionForLlamaBuild
+    if (-not $Version) {
+        return "CUDA Toolkit"
+    }
+    return "CUDA Toolkit $Version"
+}
+
+function Get-CudaToolkitVersionFromNvccPath {
+    param([Parameter(Mandatory=$true)][string]$NvccPath)
+
+    $ToolkitRoot = Split-Path -Parent (Split-Path -Parent $NvccPath)
+    $VersionName = Split-Path -Leaf $ToolkitRoot
+    if ($VersionName -match "^v(?<version>\d+(\.\d+)?)") {
+        return $Matches.version
+    }
+    return $null
+}
+
+function Get-CudaToolkitMajorFromNvccPath {
+    param([Parameter(Mandatory=$true)][string]$NvccPath)
+
+    $Version = Get-CudaToolkitVersionFromNvccPath -NvccPath $NvccPath
+    if ($Version -and $Version -match "^(?<major>\d+)") {
+        return [int]$Matches.major
+    }
+    return $null
+}
+
 function Find-Nvcc {
+    $Candidates = @()
+    if ($LlamaCudaToolkitRoot) {
+        $Candidates += (Join-Path $LlamaCudaToolkitRoot "bin\nvcc.exe")
+    }
     $Command = Get-Command nvcc.exe -ErrorAction SilentlyContinue
     if ($Command) {
-        return $Command.Source
+        $Candidates += $Command.Source
     }
-
-    $Candidates = @()
     if ($env:CUDA_PATH) {
         $Candidates += (Join-Path $env:CUDA_PATH "bin\nvcc.exe")
     }
@@ -445,12 +547,36 @@ function Find-Nvcc {
             ForEach-Object { Join-Path $_.FullName "bin\nvcc.exe" }
     }
 
-    foreach ($Candidate in $Candidates) {
+    $ExistingCandidates = @()
+    foreach ($Candidate in ($Candidates | Select-Object -Unique)) {
         if ($Candidate -and (Test-Path $Candidate)) {
-            return $Candidate
+            $ExistingCandidates += $Candidate
         }
     }
-    return $null
+    if (-not $ExistingCandidates) {
+        return $null
+    }
+
+    $RequiredVersion = Get-RequiredCudaToolkitVersionForLlamaBuild
+    if ($RequiredVersion) {
+        foreach ($Candidate in $ExistingCandidates) {
+            $Version = Get-CudaToolkitVersionFromNvccPath -NvccPath $Candidate
+            if ($Version -eq $RequiredVersion) {
+                return $Candidate
+            }
+        }
+    }
+
+    $PreferredMajor = Get-PreferredCudaToolkitMajorForLlamaBuild
+    if ($PreferredMajor) {
+        foreach ($Candidate in $ExistingCandidates) {
+            $Major = Get-CudaToolkitMajorFromNvccPath -NvccPath $Candidate
+            if ($Major -eq $PreferredMajor) {
+                return $Candidate
+            }
+        }
+    }
+    return ($ExistingCandidates | Select-Object -First 1)
 }
 
 function Find-VisualStudioWithVCTools {
@@ -508,10 +634,14 @@ function Import-BatchEnvironment {
 
 function Ensure-VisualStudioCompilerEnvironment {
     $ExistingCl = Get-Command cl.exe -ErrorAction SilentlyContinue
-    if ($ExistingCl) {
+    $ExistingRc = Get-Command rc.exe -ErrorAction SilentlyContinue
+    $ExistingMt = Get-Command mt.exe -ErrorAction SilentlyContinue
+    if ($ExistingCl -and $ExistingRc -and $ExistingMt) {
         Write-Host "  MSVC compiler: $($ExistingCl.Source)"
-        $env:CC = "cl.exe"
-        $env:CXX = "cl.exe"
+        $env:CC = $ExistingCl.Source
+        $env:CXX = $ExistingCl.Source
+        $env:RC = $ExistingRc.Source
+        Write-Host "  Windows SDK tools: rc=$($ExistingRc.Source); mt=$($ExistingMt.Source)"
         return
     }
 
@@ -535,23 +665,140 @@ function Ensure-VisualStudioCompilerEnvironment {
     if (-not $Cl) {
         throw "cl.exe was not found after loading the Visual Studio build environment."
     }
-    $env:CC = "cl.exe"
-    $env:CXX = "cl.exe"
+    $Rc = Get-Command rc.exe -ErrorAction SilentlyContinue
+    $Mt = Get-Command mt.exe -ErrorAction SilentlyContinue
+    if (-not $Rc -or -not $Mt) {
+        throw "Windows SDK build tools rc.exe and mt.exe were not found after loading the Visual Studio build environment. Install the Windows 10/11 SDK component for Visual Studio Build Tools, then rerun build_app.ps1."
+    }
+    $env:CC = $Cl.Source
+    $env:CXX = $Cl.Source
+    $env:RC = $Rc.Source
     Write-Host "  MSVC compiler: $($Cl.Source)"
+    Write-Host "  Windows SDK tools: rc=$($Rc.Source); mt=$($Mt.Source)"
 }
 
 function Invoke-WingetInstall {
     param(
         [Parameter(Mandatory=$true)][string]$PackageId,
+        [string]$Version = "",
+        [switch]$Force,
         [string[]]$ExtraArgs = @()
     )
     $Winget = Get-Command winget -ErrorAction SilentlyContinue
     if (-not $Winget) {
         return $false
     }
-    Write-Host "Installing $PackageId with winget..."
-    & winget install --id $PackageId --exact --silent --accept-package-agreements --accept-source-agreements @ExtraArgs
+    $VersionArgs = @()
+    $VersionText = ""
+    if ($Version) {
+        $VersionArgs = @("--version", $Version)
+        $VersionText = " $Version"
+    }
+    if ($Force) {
+        $VersionArgs += "--force"
+    }
+    Write-Host "Installing $PackageId$VersionText with winget..."
+    & winget install --id $PackageId --exact @VersionArgs --silent --accept-package-agreements --accept-source-agreements @ExtraArgs
     return ($LASTEXITCODE -eq 0)
+}
+
+function Install-RequiredCudaToolkit {
+    $RequiredVersion = Get-RequiredCudaToolkitVersionForLlamaBuild
+    if (-not $RequiredVersion) {
+        return $false
+    }
+
+    $RuntimePlan = Get-PaddleGpuRuntimePlan
+    Write-Host "CUDA Toolkit was not found in a version matching $($RuntimePlan.CudaLabel)."
+    Write-Host "Installing CUDA Toolkit $RequiredVersion automatically for $($RuntimePlan.Mode)..."
+
+    $Installed = Invoke-WingetInstall -PackageId $CudaToolkitWingetId -Version $RequiredVersion -Force
+    if (-not $Installed) {
+        return $false
+    }
+
+    return $true
+}
+
+function Get-LlamaPipTempDir {
+    if ($LlamaPipTempDir) {
+        return [System.IO.Path]::GetFullPath($LlamaPipTempDir)
+    }
+
+    $Root = [System.IO.Path]::GetPathRoot($RootDir)
+    if ($Root) {
+        return (Join-Path $Root "t")
+    }
+
+    return (Join-Path $RootDir ".pip-tmp")
+}
+
+function Restore-EnvironmentVariable {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [AllowNull()][string]$Value
+    )
+
+    if ($null -eq $Value) {
+        Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue
+    } else {
+        Set-Item -LiteralPath "Env:$Name" -Value $Value
+    }
+}
+
+function New-CMakeFilePathDefinition {
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$Path
+    )
+
+    $Normalized = $Path.Replace("\", "/")
+    return ('-D{0}:FILEPATH="{1}"' -f $Name, $Normalized)
+}
+
+function Invoke-PipWithShortTemp {
+    param([Parameter(Mandatory=$true)][string[]]$Arguments)
+
+    $ShortPipTempDir = Get-LlamaPipTempDir
+    New-Item -ItemType Directory -Force -Path $ShortPipTempDir | Out-Null
+
+    $OldTemp = $env:TEMP
+    $OldTmp = $env:TMP
+    $OldTmpDir = $env:TMPDIR
+    try {
+        $env:TEMP = $ShortPipTempDir
+        $env:TMP = $ShortPipTempDir
+        $env:TMPDIR = $ShortPipTempDir
+        & $Python -m pip @Arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "pip failed: python -m pip $($Arguments -join ' ')"
+        }
+    } finally {
+        Restore-EnvironmentVariable -Name "TEMP" -Value $OldTemp
+        Restore-EnvironmentVariable -Name "TMP" -Value $OldTmp
+        Restore-EnvironmentVariable -Name "TMPDIR" -Value $OldTmpDir
+    }
+}
+
+function Install-ProjectRequirements {
+    $RequirementsPath = Join-Path $AppDir "requirements.txt"
+    $RuntimePlan = Get-PaddleGpuRuntimePlan
+    $InstallLlamaSeparately = (-not $SkipDependencyInstall) -and ($LlamaCudaInstallMode -ne "skip") -and ($RuntimePlan.Mode -ne "cpu")
+
+    if (-not $InstallLlamaSeparately) {
+        Invoke-PipWithShortTemp -Arguments @("install", "-r", $RequirementsPath)
+        return
+    }
+
+    $TempDir = Get-LlamaPipTempDir
+    New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
+    $FilteredRequirementsPath = Join-Path $TempDir "boku_requirements_without_llama.txt"
+    $Lines = Get-Content -LiteralPath $RequirementsPath |
+        Where-Object { $_.Trim() -notmatch "^(llama-cpp-python)(\s|[<>=!~].*)?$" }
+    Set-Content -LiteralPath $FilteredRequirementsPath -Value $Lines -Encoding UTF8
+
+    Write-Host "Installing project requirements without llama-cpp-python; it is installed later with the selected CUDA mode."
+    Invoke-PipWithShortTemp -Arguments @("install", "-r", $FilteredRequirementsPath)
 }
 
 function Ensure-LlamaSourceBuildPrerequisites {
@@ -563,12 +810,27 @@ function Ensure-LlamaSourceBuildPrerequisites {
     Ensure-VisualStudioCompilerEnvironment
 
     $Nvcc = Find-Nvcc
-    if (-not $Nvcc) {
-        $Installed = Invoke-WingetInstall -PackageId $CudaToolkitWingetId
-        $Nvcc = Find-Nvcc
-        if (-not $Installed -or -not $Nvcc) {
-            throw "CUDA Toolkit nvcc.exe was not found. Install NVIDIA CUDA Toolkit 12.8 or newer, then rerun build_app.ps1."
+    $RequiredVersion = Get-RequiredCudaToolkitVersionForLlamaBuild
+    $DetectedVersion = if ($Nvcc) { Get-CudaToolkitVersionFromNvccPath -NvccPath $Nvcc } else { $null }
+    if (-not $Nvcc -or ($RequiredVersion -and $DetectedVersion -ne $RequiredVersion)) {
+        if ($Nvcc -and $DetectedVersion) {
+            Write-Host "Found CUDA Toolkit $DetectedVersion, but $RequiredVersion is required for this GPU runtime: $Nvcc"
         }
+        $Installed = Install-RequiredCudaToolkit
+        $Nvcc = Find-Nvcc
+        $DetectedVersion = if ($Nvcc) { Get-CudaToolkitVersionFromNvccPath -NvccPath $Nvcc } else { $null }
+        if (-not $Installed -or -not $Nvcc -or ($RequiredVersion -and $DetectedVersion -ne $RequiredVersion)) {
+            $RequiredLabel = Get-RequiredCudaToolkitLabelForLlamaBuild
+            throw "$RequiredLabel nvcc.exe was not found after automatic installation. Install $RequiredLabel manually or pass -LlamaCudaToolkitRoot to its install directory, then rerun build_app.ps1."
+        }
+    }
+
+    $PreferredMajor = Get-PreferredCudaToolkitMajorForLlamaBuild
+    $DetectedMajor = Get-CudaToolkitMajorFromNvccPath -NvccPath $Nvcc
+    if ($PreferredMajor -and $DetectedMajor -and $DetectedMajor -ne $PreferredMajor) {
+        $RuntimePlan = Get-PaddleGpuRuntimePlan
+        $RequiredLabel = if ($PreferredMajor -eq 11) { "CUDA 11.8" } else { "CUDA 12.x" }
+        throw "Selected Paddle runtime '$($RuntimePlan.Mode)' requires a $RequiredLabel Toolkit for llama-cpp-python source builds, but nvcc was found under CUDA $DetectedMajor`: $Nvcc. Install $RequiredLabel Toolkit or pass -LlamaCudaToolkitRoot to its install directory, then rerun build_app.ps1."
     }
 
     $CudaHome = Split-Path -Parent (Split-Path -Parent $Nvcc)
@@ -585,7 +847,7 @@ function Install-LlamaCudaWheel {
     }
     Write-Host "Installing CUDA-enabled llama-cpp-python wheel..."
     Write-Host "  index: $EffectiveLlamaCudaWheelIndex"
-    & $Python -m pip install --upgrade --force-reinstall --no-cache-dir --prefer-binary --no-deps --index-url $EffectiveLlamaCudaWheelIndex "llama-cpp-python==$LlamaCppPythonVersion"
+    & $Python -m pip install --upgrade --force-reinstall --prefer-binary --no-deps --index-url $EffectiveLlamaCudaWheelIndex "llama-cpp-python==$LlamaCppPythonVersion"
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to install CUDA llama-cpp-python wheel from $EffectiveLlamaCudaWheelIndex."
     }
@@ -594,17 +856,42 @@ function Install-LlamaCudaWheel {
 function Install-LlamaCudaFromSource {
     Ensure-LlamaSourceBuildPrerequisites
     $Arch = Get-CudaArchitectureForLlamaBuild
+    $ShortPipTempDir = Get-LlamaPipTempDir
+    New-Item -ItemType Directory -Force -Path $ShortPipTempDir | Out-Null
+
     Write-Host "Building llama-cpp-python with CUDA from source..."
     Write-Host "  version: $LlamaCppPythonVersion"
     Write-Host "  CMAKE_CUDA_ARCHITECTURES=$Arch"
+    Write-Host "  pip temp: $ShortPipTempDir"
 
     $OldCmakeArgs = $env:CMAKE_ARGS
     $OldForceCmake = $env:FORCE_CMAKE
     $OldGenerator = $env:CMAKE_GENERATOR
+    $OldTemp = $env:TEMP
+    $OldTmp = $env:TMP
+    $OldTmpDir = $env:TMPDIR
+    $OldCudaHostCxx = $env:CUDAHOSTCXX
     try {
-        $env:CMAKE_ARGS = "-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=$Arch"
+        $Mt = Get-Command mt.exe -ErrorAction SilentlyContinue
+        if (-not $Mt) {
+            throw "mt.exe was not found after loading the Visual Studio build environment."
+        }
+        $CmakeArgs = @(
+            "-DGGML_CUDA=on",
+            "-DCMAKE_CUDA_ARCHITECTURES=$Arch",
+            (New-CMakeFilePathDefinition -Name "CMAKE_C_COMPILER" -Path $env:CC),
+            (New-CMakeFilePathDefinition -Name "CMAKE_CXX_COMPILER" -Path $env:CXX),
+            (New-CMakeFilePathDefinition -Name "CMAKE_CUDA_HOST_COMPILER" -Path $env:CXX),
+            (New-CMakeFilePathDefinition -Name "CMAKE_RC_COMPILER" -Path $env:RC),
+            (New-CMakeFilePathDefinition -Name "CMAKE_MT" -Path $Mt.Source)
+        )
+        $env:CMAKE_ARGS = ($CmakeArgs -join " ")
         $env:FORCE_CMAKE = "1"
         $env:CMAKE_GENERATOR = "Ninja"
+        $env:CUDAHOSTCXX = $env:CXX
+        $env:TEMP = $ShortPipTempDir
+        $env:TMP = $ShortPipTempDir
+        $env:TMPDIR = $ShortPipTempDir
         & $Python -m pip uninstall -y llama-cpp-python
         & $Python -m pip install --upgrade --force-reinstall --no-cache-dir --no-deps --no-binary=llama-cpp-python "llama-cpp-python==$LlamaCppPythonVersion"
         if ($LASTEXITCODE -ne 0) {
@@ -614,6 +901,10 @@ function Install-LlamaCudaFromSource {
         $env:CMAKE_ARGS = $OldCmakeArgs
         $env:FORCE_CMAKE = $OldForceCmake
         $env:CMAKE_GENERATOR = $OldGenerator
+        Restore-EnvironmentVariable -Name "TEMP" -Value $OldTemp
+        Restore-EnvironmentVariable -Name "TMP" -Value $OldTmp
+        Restore-EnvironmentVariable -Name "TMPDIR" -Value $OldTmpDir
+        Restore-EnvironmentVariable -Name "CUDAHOSTCXX" -Value $OldCudaHostCxx
     }
 }
 
@@ -739,10 +1030,7 @@ except Exception:
 }
 
 function Confirm-LlamaCppGpuOffload {
-    param(
-        [string]$Context = "llama-cpp-python",
-        [switch]$NoThrow
-    )
+    param([string]$Context = "llama-cpp-python")
 
     Write-Host "Verifying CUDA llama.cpp GPU offload support ($Context)..."
     if (Test-LlamaCppGpuOffload) {
@@ -752,13 +1040,10 @@ function Confirm-LlamaCppGpuOffload {
 
     $Summary = Get-LlamaCppLibrarySummary
     $Message = "CUDA llama.cpp GPU offload could not be verified. Libraries: $Summary"
-    if ($RequireLlamaCuda -and -not $NoThrow) {
+    if ($RequireLlamaCuda) {
         throw $Message
     }
     Write-Warning $Message
-    if ($NoThrow) {
-        return $false
-    }
     Write-Warning "Continuing build. Translation may run on CPU or show a runtime error until llama-cpp-python is rebuilt with CUDA."
     return $false
 }
@@ -775,38 +1060,19 @@ function Install-LlamaCppPythonCuda {
         return
     }
 
-    $RequestedMode = $LlamaCudaInstallMode
-    $Mode = $RequestedMode
+    $Mode = $LlamaCudaInstallMode
     if ($Mode -eq "auto") {
         $Mode = if ($RuntimePlan.Mode -eq "cuda129") { "source" } else { "wheel" }
     }
 
     if ($Mode -eq "source") {
         Install-LlamaCudaFromSource
-        Sync-LlamaCppBinaryDlls
-        Confirm-LlamaCppGpuOffload -Context "after source install" | Out-Null
-        return
-    }
-
-    Install-LlamaCudaWheel
-    Sync-LlamaCppBinaryDlls
-    if (Confirm-LlamaCppGpuOffload -Context "after wheel install" -NoThrow) {
-        return
-    }
-
-    if ($RequestedMode -eq "auto") {
-        Write-Warning "CUDA llama.cpp wheel verification failed. Falling back to a local CUDA source build. This can take a long time."
-        Install-LlamaCudaFromSource
-        Sync-LlamaCppBinaryDlls
-        Confirm-LlamaCppGpuOffload -Context "after source fallback" | Out-Null
-        return
-    }
-
-    if ($RequireLlamaCuda) {
-        throw "CUDA llama.cpp GPU offload could not be verified after the requested wheel install. Try rerunning with -LlamaCudaInstallMode source."
     } else {
-        Write-Warning "Continuing after requested wheel install failed CUDA verification."
+        Install-LlamaCudaWheel
     }
+
+    Sync-LlamaCppBinaryDlls
+    Confirm-LlamaCppGpuOffload -Context "after install" | Out-Null
 }
 
 function Ensure-CompatiblePythonPackages {
@@ -927,7 +1193,7 @@ try {
     & $Python -m pip install --upgrade pip
 
     if (-not $SkipDependencyInstall) {
-        & $Python -m pip install -r requirements.txt
+        Install-ProjectRequirements
         Install-CudaPythonPackages
     }
 

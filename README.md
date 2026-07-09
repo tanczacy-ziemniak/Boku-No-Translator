@@ -93,78 +93,21 @@ Official release supporters will be listed here. Listing is opt-in, so only name
 Build the packaged app from the source ZIP:
 
 1. Extract the ZIP first. Do not run it from inside the compressed folder.
-2. Double-click `build_app.bat`.
-3. Keep the window open until it says `Build finished`.
-
-`build_app.bat` opens PowerShell with a temporary execution-policy bypass, starts `build_app.ps1`, and chooses the GPU runtime automatically:
-
-- RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090: Paddle CUDA 12.9 and llama.cpp CUDA source build
-- RTX/GTX 20, 30, and 40 series GPUs: Paddle CUDA 12.6 and llama.cpp CUDA wheel, with source build fallback if GPU offload cannot be verified
-- Older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards: Paddle CUDA 11.8 and llama.cpp CUDA wheel, with source build fallback if GPU offload cannot be verified
-- No detected NVIDIA GPU: CPU Paddle runtime
-
-`build_app.ps1` creates `.venv` automatically. If Python 3.11 is missing, it tries to install Python 3.11 with `winget`. If `winget` is unavailable or does not expose Python after install, the script downloads the official Python 3.11 Windows installer from python.org and installs it silently for the current user.
-
-By default, the build script also prepares the Python-side CUDA runtime used by the bundled app:
-
-- installs NVIDIA CUDA/cuDNN Python wheels such as `nvidia-cudnn-cu12`
-- installs CUDA-enabled `llama-cpp-python`; RTX 20/30/40 class GPUs try the configured CUDA wheel index first and then fall back to a local CUDA source build if GPU offload cannot be verified, while RTX 50 / Blackwell builds from source automatically
-- detects NVIDIA GPUs with `nvidia-smi` and selects the Paddle runtime automatically
-
-Advanced manual build commands:
-
-Paddle CUDA 12.9 for RTX 50 / Blackwell GPUs such as RTX 5070, 5080, and 5090:
-
+2. Open PowerShell and change to the extracted folder (run as Administrator if you want the script to install Python via winget). For example:
+```cd "C:\path\to\extracted\Boku-No-Translator"```
+3. Temporarily allow script execution for this session and start the build:
 ```powershell
-.\build_app.ps1 -PaddleGpuRuntime cuda129 -LlamaCudaInstallMode source -RequireLlamaCuda
+Set-ExecutionPolicy Bypass -Scope Process -Force
+.\build_app.ps1 -LlamaCudaInstallMode source -RequireLlamaCuda
 ```
-
-Paddle CUDA 12.6 for modern RTX/GTX GPUs such as RTX 20, 30, and 40 series:
-
+4. After the build completes, preload models and verify they load correctly:
 ```powershell
-.\build_app.ps1 -PaddleGpuRuntime cuda126 -LlamaCudaInstallMode auto -RequireLlamaCuda
+cd .\dist\boku-no-translator
+.\preload_models.bat
 ```
-
-Paddle CUDA 11.8 for older supported NVIDIA GPUs such as Pascal/Volta class GTX 10 or Tesla P/V cards:
-
+5. If preloading succeeds, run the packaged app:
 ```powershell
-.\build_app.ps1 -PaddleGpuRuntime cuda118 -LlamaCudaInstallMode auto -RequireLlamaCuda
-```
-
-NVIDIA display drivers are not installed by the script. Install or update the NVIDIA driver separately if `nvidia-smi` is not available. RTX 50 / Blackwell translation GPU support also needs a CUDA source build of `llama-cpp-python`; the script tries to prepare Visual Studio Build Tools and CUDA Toolkit with `winget` when they are missing.
-
-If the build previously stopped with `CUDA llama.cpp GPU offload could not be verified`, update the source files and run `build_app.bat` again. The script now disables pip's wheel cache for the CUDA wheel and automatically retries with a local CUDA source build in `auto` mode.
-
-Useful build options:
-
-```powershell
-.\build_app.ps1 -CpuOnly
-.\build_app.ps1 -PaddleGpuRuntime auto
-.\build_app.ps1 -PaddleGpuRuntime cuda118
-.\build_app.ps1 -PaddleGpuRuntime cuda126
-.\build_app.ps1 -PaddleGpuRuntime cuda129
-.\build_app.ps1 -PaddleGpuRuntime cpu
-.\build_app.ps1 -LlamaCudaInstallMode auto
-.\build_app.ps1 -LlamaCudaInstallMode source
-.\build_app.ps1 -LlamaCudaInstallMode wheel
-.\build_app.ps1 -RequireLlamaCuda
-.\build_app.ps1 -ForceBlackwellPaddle
-.\build_app.ps1 -Python311InstallerUrl "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
-.\build_app.ps1 -LlamaCudaWheelIndex "https://abetlen.github.io/llama-cpp-python/whl/cu124"
-.\build_app.ps1 -SkipDependencyInstall
-```
-
-
-The app executable is created at:
-
-```text
-dist\boku-no-translator\boku-no-translator.exe
-```
-
-Before running `boku-no-translator.exe`, run this once:
-
-```text
-dist\boku-no-translator\preload_models.bat
+.\boku-no-translator.exe
 ```
 
 
@@ -196,24 +139,6 @@ boku-no-translator.exe --preload-models
 
 The ZIP also includes `preload_models.bat`, which runs the same command and keeps the console open so you can see progress and errors.
 
-## CI/CD
-
-This repository includes GitHub Actions workflows:
-
-- `CI`: runs automatically on pushes and pull requests. It checks Python syntax, PowerShell script syntax, and required package files.
-- `Build Release`: runs manually or when a tag like `v1.0.0` is pushed. It builds a Windows CPU package, uploads it as a workflow artifact, and attaches it to a GitHub Release for version tags.
-- `Build GPU Release (self-hosted)`: runs manually on your own Windows NVIDIA GPU runner. Use this for CUDA packages such as `cuda118`, `cuda126`, and `cuda129`.
-
-To publish a CPU release:
-
-```powershell
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Then open GitHub > Actions > `Build Release`. When it finishes, the ZIP and `.sha256` checksum will be attached to the GitHub Release.
-
-GPU release builds need a self-hosted Windows runner with an NVIDIA GPU, NVIDIA driver, and the runner label `nvidia-gpu`. After that runner is online, open GitHub > Actions > `Build GPU Release (self-hosted)` and choose the Paddle runtime.
 
 ## Devices
 
@@ -235,7 +160,6 @@ The overlay status tells you what is actually connected:
 - Yellow: CPU fallback
 - Gray: loading or downloading
 - Red: failed, check `%LOCALAPPDATA%\boku-no-translator\logs\app.log`
-
 
 
 
