@@ -6,6 +6,8 @@ opencv-python==4.10.0.84
 opencv-python-headless==4.10.0.84
 PyYAML>=6.0.1
 paddleocr>=3.3.0
-meikiocr>=0.3.4
 huggingface_hub>=0.23.0
 llama-cpp-python>=0.2.90
+diskcache
+jinja2
+
